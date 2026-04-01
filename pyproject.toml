@@ -2,7 +2,7 @@
 name = "octoopt2"
 version = "0.1.0"
 description = "Home energy cost optimizer for GivEnergy + Octopus Agile + Mitsubishi Ecodan"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.13.5",
     "crccheck>=1.3.1",
@@ -21,6 +21,7 @@ dependencies = [
 octoopt2 = "octoopt2.main:main"
 octoopt2-setup = "scripts.setup:main"
 octoopt2-preload-consumption = "scripts.preload_consumption:main"
+octoopt2-report = "scripts.report:main"
 
 [build-system]
 requires = ["hatchling"]
