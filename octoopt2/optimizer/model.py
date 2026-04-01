@@ -79,6 +79,7 @@ def optimize(
     battery: BatteryConfig,
     dhw: DhwConfig,
     givenergy: GivEnergyConfig,
+    manage_dhw: bool = True,
 ) -> OptimizerResult:
     """Run the MILP optimizer and return a schedule.
 
@@ -168,9 +169,13 @@ def optimize(
         prob += grid_export[t] <= max_export_kwh * (1 - is_importing[t])
 
     # ── DHW daily minimums and maximums ───────────────────────────────────
-    for day_slots in _group_slots_by_day(inputs.slot_starts):
-        prob += pulp.lpSum(dhw_on[t] for t in day_slots) >= dhw.min_slots_per_day
-        prob += pulp.lpSum(dhw_on[t] for t in day_slots) <= dhw.max_slots_per_day
+    if manage_dhw:
+        for day_slots in _group_slots_by_day(inputs.slot_starts):
+            prob += pulp.lpSum(dhw_on[t] for t in day_slots) >= dhw.min_slots_per_day
+            prob += pulp.lpSum(dhw_on[t] for t in day_slots) <= dhw.max_slots_per_day
+    else:
+        for t in range(n):
+            prob += dhw_on[t] == 0
 
     # ── Solve ─────────────────────────────────────────────────────────────
     solver = pulp.getSolver("PULP_CBC_CMD", msg=False, timeLimit=30)

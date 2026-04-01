@@ -35,12 +35,14 @@ LONDON = ZoneInfo("Europe/London")
 _FALLBACK_LOAD_KWH = 0.5
 
 
-def run(config: AppConfig, dry_run: bool = False) -> None:
+def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True) -> None:
     """Execute one optimization tick.
 
-    dry_run=True: runs every step except writing to hardware. Prints the
-    full planned schedule and the command that would be sent for the current
-    slot, then exits without touching the inverter or Ecodan.
+    dry_run=True:    runs every step except writing to hardware. Prints the
+                     full planned schedule and the command that would be sent
+                     for the current slot, then exits without touching hardware.
+    manage_dhw=False: skip all DHW control; Ecodan stays in its own auto mode
+                     and DHW is excluded from the optimization.
     """
     now = datetime.now(timezone.utc)
     logger.info("── Scheduler tick %s ──", now.strftime("%Y-%m-%dT%H:%M:%SZ"))
@@ -110,7 +112,7 @@ def run(config: AppConfig, dry_run: bool = False) -> None:
 
     # ── 5. Optimize ────────────────────────────────────────────────────────
     try:
-        result = optimize(inputs, config.battery, config.dhw, config.givenergy)
+        result = optimize(inputs, config.battery, config.dhw, config.givenergy, manage_dhw=manage_dhw)
         logger.info(
             "Optimization complete: status=%s total_cost=£%.4f",
             result.solver_status,
@@ -123,7 +125,7 @@ def run(config: AppConfig, dry_run: bool = False) -> None:
 
     # ── 6. Save schedule (skipped in dry-run) ────────────────────────────
     if dry_run:
-        _print_dry_run(result, inputs, now, config)
+        _print_dry_run(result, inputs, now, config, manage_dhw=manage_dhw)
         return
 
     try:
@@ -152,7 +154,7 @@ def run(config: AppConfig, dry_run: bool = False) -> None:
         logger.error("Failed to apply inverter decision: %s", exc)
 
     try:
-        set_dhw(config.melcloud, decision.dhw_on)
+        set_dhw(config.melcloud, decision.dhw_on if manage_dhw else False)
     except Exception as exc:
         logger.error("Failed to apply DHW decision: %s", exc)
 
@@ -162,7 +164,7 @@ def run(config: AppConfig, dry_run: bool = False) -> None:
 
 # ── Dry-run output ────────────────────────────────────────────────────────
 
-def _print_dry_run(result, inputs, now: datetime, config: AppConfig) -> None:
+def _print_dry_run(result, inputs, now: datetime, config: AppConfig, manage_dhw: bool = True) -> None:
     """Print the full planned schedule and current-slot command to stdout."""
     from .control.inverter import _kw_to_register
 
@@ -178,6 +180,7 @@ def _print_dry_run(result, inputs, now: datetime, config: AppConfig) -> None:
     print(f"  Solver status: {result.solver_status}")
     print(f"  Total cost   : £{result.total_cost_gbp:.4f}")
     print(f"  Slots        : {len(result.decisions)}")
+    print(f"  DHW control  : {'managed by optimizer' if manage_dhw else 'disabled (auto)'}")
     print("=" * 100)
 
     # Column header
@@ -263,7 +266,10 @@ def _print_dry_run(result, inputs, now: datetime, config: AppConfig) -> None:
             print(f"               set_discharge_enable(True) + disable_charge()")
         else:
             print(f"    Inverter : ECO — set_mode_dynamic()")
-        print(f"    Ecodan   : DHW {'force_hot_water' if d.dhw_on else 'auto (off)'}")
+        if manage_dhw:
+            print(f"    Ecodan   : DHW {'force_hot_water' if d.dhw_on else 'auto (off)'}")
+        else:
+            print(f"    Ecodan   : DHW unmanaged (auto)")
     print()
 
 

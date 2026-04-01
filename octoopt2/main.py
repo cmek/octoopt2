@@ -32,12 +32,17 @@ def main() -> None:
         action="store_true",
         help="Run optimizer and print planned schedule without sending any commands to hardware",
     )
+    parser.add_argument(
+        "--no-dhw",
+        action="store_true",
+        help="Disable DHW management — Ecodan stays in auto mode, DHW is excluded from optimization",
+    )
     args = parser.parse_args()
 
     config = AppConfig.from_env()
     init_db(config.db_path)
     try:
-        run(config, dry_run=args.dry_run)
+        run(config, dry_run=args.dry_run, manage_dhw=not args.no_dhw)
     except Exception as exc:
         logger.exception("Unhandled error in scheduler tick: %s", exc)
         sys.exit(1)
