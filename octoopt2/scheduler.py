@@ -21,7 +21,7 @@ from .data.consumption import fetch_and_store_consumption
 from .data.inverter import get_latest_reading, read_and_store
 from .data.octopus import fetch_and_store_prices, get_prices_from, missing_price_dates
 from .data.solcast import fetch_and_store_actuals, fetch_and_store_forecast, get_forecast
-from .data.weather import fetch_and_store_weather, get_temperature_forecast
+from .data.weather import backfill_weather_history, fetch_and_store_weather, get_temperature_forecast
 from .db import get_conn
 from .optimizer.forecast import fit_load_model, get_temperature_per_slot
 from .optimizer.model import OptimizerInput, optimize
@@ -326,6 +326,13 @@ def _refresh_feeds(config: AppConfig, now: datetime) -> None:
         fetch_and_store_weather(config.location, config.db_path)
     except Exception as exc:
         logger.warning("Weather fetch failed: %s", exc)
+
+    # Open-Meteo archive — backfill historical weather for load model training
+    # (no-op once sufficient history is present)
+    try:
+        backfill_weather_history(config.location, config.db_path)
+    except Exception as exc:
+        logger.warning("Weather history backfill failed: %s", exc)
 
 
 def _remaining_slots(db_path: str, now: datetime) -> list[datetime]:

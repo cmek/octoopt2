@@ -1,6 +1,11 @@
-"""Fetch 15-minute weather forecasts from Open-Meteo (free, no API key required)."""
+"""Fetch 15-minute weather forecasts from Open-Meteo (free, no API key required).
+
+Historical weather (for load model training) is backfilled from the Open-Meteo
+archive API which provides hourly data going back years. The ±30-minute nearest-
+neighbour matching in the load model handles the hourly→30-min resolution gap.
+"""
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 
@@ -10,6 +15,7 @@ from ..db import get_conn
 logger = logging.getLogger(__name__)
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 # Refresh weather at most once per hour — it changes slowly and there are no
 # hard rate limits on the free tier, but there's no point fetching more often.
@@ -121,6 +127,100 @@ def fetch_and_store_weather(
         )
 
     logger.info("Stored %d weather slots", len(rows))
+    return len(rows)
+
+
+def backfill_weather_history(
+    location: LocationConfig,
+    db_path: str,
+    days: int = 35,
+) -> int:
+    """Fetch hourly historical weather from the Open-Meteo archive API.
+
+    Fills the weather_forecast table with past temperature data so the load
+    model can be trained against historical consumption. Only fetches slots
+    not already present in the DB.
+
+    Returns the number of new slots stored.
+    """
+    end_date = date.today() - timedelta(days=1)  # archive lags by ~1 day
+    start_date = end_date - timedelta(days=days - 1)
+
+    # Check how many historical slots we already have
+    start_dt = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc)
+    end_dt = datetime(end_date.year, end_date.month, end_date.day, 23, 0, tzinfo=timezone.utc)
+    with get_conn(db_path) as conn:
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM weather_forecast WHERE slot_start >= ? AND slot_start <= ?",
+            (start_dt.isoformat(), end_dt.isoformat()),
+        ).fetchone()[0]
+
+    if existing >= days * 20:  # ~24 hourly slots/day, allow some gaps
+        logger.debug(
+            "Historical weather already present (%d slots from %s), skipping backfill",
+            existing, start_date,
+        )
+        return 0
+
+    logger.info(
+        "Backfilling historical weather %s → %s (%d days)",
+        start_date, end_date, days,
+    )
+    resp = requests.get(
+        OPEN_METEO_ARCHIVE_URL,
+        params={
+            "latitude": location.latitude,
+            "longitude": location.longitude,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "hourly": "temperature_2m,cloud_cover,wind_speed_10m,relative_humidity_2m,precipitation",
+            "timezone": "UTC",
+            "wind_speed_unit": "ms",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    hourly = data.get("hourly", {})
+    times = hourly.get("time", [])
+    if not times:
+        logger.warning("No historical weather data returned from Open-Meteo archive")
+        return 0
+
+    temperature = hourly.get("temperature_2m", [None] * len(times))
+    cloud_cover = hourly.get("cloud_cover", [None] * len(times))
+    wind_speed  = hourly.get("wind_speed_10m", [None] * len(times))
+    humidity    = hourly.get("relative_humidity_2m", [None] * len(times))
+    precip      = hourly.get("precipitation", [None] * len(times))
+
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for i, t in enumerate(times):
+        slot_start = datetime.fromisoformat(t).replace(tzinfo=timezone.utc).isoformat()
+        rows.append((
+            slot_start,
+            temperature[i],
+            cloud_cover[i],
+            wind_speed[i],
+            humidity[i],
+            precip[i],
+            fetched_at,
+        ))
+
+    with get_conn(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO weather_forecast
+                (slot_start, temperature_c, cloud_cover_pct, wind_speed_ms,
+                 humidity_pct, precipitation_mm, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slot_start) DO NOTHING
+            """,
+            rows,
+        )
+
+    logger.info("Stored %d historical weather slots (%s → %s)", len(rows), start_date, end_date)
     return len(rows)
 
 

@@ -295,13 +295,18 @@ def seed_solar(config) -> None:
 
 
 def seed_weather(config) -> None:
-    _section("4d. Seeding weather forecast")
-    from octoopt2.data.weather import fetch_and_store_weather
+    _section("4d. Seeding weather forecast + history")
+    from octoopt2.data.weather import backfill_weather_history, fetch_and_store_weather
     try:
         n = fetch_and_store_weather(config.location, config.db_path, forecast_days=3, force=True)
-        _ok(f"Weather: {n} 15-min slots stored")
+        _ok(f"Weather forecast: {n} 15-min slots stored")
     except Exception as exc:
-        _fail(f"Weather: {exc}")
+        _fail(f"Weather forecast: {exc}")
+    try:
+        n = backfill_weather_history(config.location, config.db_path, days=35)
+        _ok(f"Weather history:  {n} hourly slots stored (for load model)")
+    except Exception as exc:
+        _fail(f"Weather history: {exc}")
 
 
 # ── Step 5: summary ───────────────────────────────────────────────────────

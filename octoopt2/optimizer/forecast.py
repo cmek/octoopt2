@@ -108,10 +108,14 @@ def fit_load_model(db_path: str) -> LoadModel | None:
 
     if len(slot_starts) < MIN_SLOTS:
         logger.warning(
-            "Only %d slots have matching temperature data — load model not fitted",
+            "Only %d slots have matching temperature data — fitting baseline-only model (α=0)",
             len(slot_starts),
         )
-        return None
+        # Fall back to fitting the per-(day_type, slot_index) baseline from all
+        # consumption data, without a temperature coefficient.
+        slot_starts = list(consumption.keys())
+        consumptions = np.array(list(consumption.values()))
+        temperatures = np.zeros(len(consumptions))  # unused when alpha=0
 
     consumptions = np.array(consumptions)
     temperatures = np.array(temperatures)
