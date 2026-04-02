@@ -32,6 +32,10 @@ UK_HOLIDAYS = holidays.country_holidays("GB", subdiv="ENG")
 # 48 slots/day × 7 days = one week minimum.
 MIN_SLOTS = 48 * 7
 
+# Floor applied to every slot prediction — represents the always-on base load
+# (router, standby devices, fridge, etc.).  300 W × 0.5 h = 0.150 kWh.
+MIN_LOAD_KWH = 0.200
+
 
 @dataclass
 class LoadModel:
@@ -68,7 +72,7 @@ class LoadModel:
             temp = _nearest_temperature(slot_start, temperatures)
             temp_adjustment = self.alpha * (temp - self.ref_temp) if temp is not None else 0.0
 
-            predictions.append(max(0.0, baseline_kwh + temp_adjustment))
+            predictions.append(max(MIN_LOAD_KWH, baseline_kwh + temp_adjustment))
         return predictions
 
 
