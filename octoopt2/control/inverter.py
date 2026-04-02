@@ -15,6 +15,7 @@ from datetime import time as dt_time
 
 from ..config import BatteryConfig, GivEnergyConfig
 from ..givenergy_modbus_async.client.client import Client
+from ..givenergy_modbus_async.model import TimeSlot
 from ..givenergy_modbus_async.client import commands
 from ..optimizer.model import SlotDecision
 
