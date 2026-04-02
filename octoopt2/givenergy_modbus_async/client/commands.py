@@ -401,7 +401,7 @@ def set_export_soc_target(idx: int, target_soc: int) -> list[TransparentRequest]
     reg = (getattr(RegisterMap, f'EXPORT_TARGET_SOC_{idx}'))
     return [WriteHoldingRegisterRequest(reg, target_soc)]
 
-def set_soc_target(discharge: bool, idx: int, target_soc: int, inv_type: str) -> list[TransparentRequest]:
+def set_soc_target(discharge: bool, idx: int, target_soc: int, inv_type: str="") -> list[TransparentRequest]:
     """ Sets inverter SOC targets for any charge or discharge slot
     """
     if not 4 <= target_soc <= 100:
@@ -602,7 +602,7 @@ def set_battery_pause_mode(val: BatteryPauseMode) -> list[TransparentRequest]:
 
 
 def _set_charge_slot(
-    discharge: bool, idx: int, slot: Optional[TimeSlot], inv_type: str
+    discharge: bool, idx: int, slot: Optional[TimeSlot], inv_type: str=""
 ) -> list[TransparentRequest]:
     hr_start, hr_end = (
         getattr(RegisterMap, f'{"TPH_" if "3ph" in inv_type else ""}{"EMS_" if "ems"  in inv_type else ""}{"DIS" if discharge else ""}CHARGE_SLOT_{idx}_START'),
@@ -622,7 +622,7 @@ def _set_charge_slot(
 
 
 def set_charge_slot_start(
-    discharge: bool, idx: int, starttime: datetime, inv_type: str
+    discharge: bool, idx: int, starttime: datetime, inv_type: str=""
 ) -> list[TransparentRequest]:
     hr_start = (
         getattr(RegisterMap, f'{"TPH_" if "3ph" in inv_type else ""}{"EMS_" if "ems"  in inv_type else ""}{"DIS" if discharge else ""}CHARGE_SLOT_{idx}_START')
@@ -630,7 +630,7 @@ def set_charge_slot_start(
     return [WriteHoldingRegisterRequest(hr_start, int(starttime.strftime("%H%M")))]
     
 def set_charge_slot_end(
-    discharge: bool, idx: int, endtime: datetime, inv_type: str
+    discharge: bool, idx: int, endtime: datetime, inv_type: str=""
 ) -> list[TransparentRequest]:
     hr_end = (
         getattr(RegisterMap, f'{"TPH_" if "3ph" in inv_type else ""}{"EMS_" if "ems"  in inv_type else ""}{"DIS" if discharge else ""}CHARGE_SLOT_{idx}_END')
