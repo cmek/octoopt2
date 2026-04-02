@@ -300,12 +300,12 @@ def _refresh_feeds(config: AppConfig, now: datetime) -> None:
     except Exception as exc:
         logger.warning("Octopus price fetch failed: %s", exc)
 
-    # Octopus consumption — fetch yesterday's data to fill any gaps
+    # Octopus consumption — fetch last 2 days to catch API data lag (typically 1-2 days)
     try:
-        yesterday_start = (now - timedelta(days=1)).replace(
+        two_days_ago = (now - timedelta(days=2)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        fetch_and_store_consumption(config.octopus, config.db_path, yesterday_start, now)
+        fetch_and_store_consumption(config.octopus, config.db_path, two_days_ago, now)
     except Exception as exc:
         logger.warning("Octopus consumption fetch failed: %s", exc)
 

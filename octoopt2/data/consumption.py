@@ -67,7 +67,7 @@ def fetch_and_store_consumption(
     )
 
     if not records:
-        logger.warning("No consumption data returned for requested window")
+        logger.info("No consumption data returned for requested window (API lag is normal for recent dates)")
         return 0
 
     rows = [
