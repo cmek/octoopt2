@@ -49,8 +49,9 @@ def apply_decision(
 def _cmds_charge(charge_kw: float, battery: BatteryConfig) -> list:
     limit = _kw_to_register(charge_kw, battery.max_charge_rate_kw)
     logger.info("Inverter → CHARGE %.2f kW (register %d)", charge_kw, limit)
+        #*commands.set_charge_slot_1((dt_time(0, 0), dt_time(23, 59))),
     return [
-        *commands.set_charge_slot_1((dt_time(0, 0), dt_time(23, 59))),
+        *commands.set_charge_slot_1(TimeSlot(start=dt_time(0, 0), end=dt_time(23, 59))),
         *commands.set_battery_charge_limit(limit),
         *commands.enable_charge(),
         *commands.disable_discharge(),
