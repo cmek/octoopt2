@@ -39,7 +39,7 @@ def _pence(gbp: float) -> str:
 def report_yesterday(db_path: str, yesterday: datetime, today: datetime) -> None:
     from octoopt2.db import get_conn
 
-    _section(f"Yesterday ({yesterday.strftime('%-d %B %Y, %A')}) — Actuals")
+    _section(f"Yesterday ({yesterday.astimezone(LONDON).strftime('%-d %B %Y, %A')}) — Actuals")
 
     with get_conn(db_path) as conn:
         rows = conn.execute(
@@ -115,7 +115,7 @@ def report_yesterday(db_path: str, yesterday: datetime, today: datetime) -> None
 def report_today(db_path: str, today: datetime, tomorrow: datetime) -> None:
     from octoopt2.db import get_conn
 
-    _section(f"Today ({today.strftime('%-d %B %Y, %A')}) — Optimizer Forecast")
+    _section(f"Today ({today.astimezone(LONDON).strftime('%-d %B %Y, %A')}) — Optimizer Forecast")
 
     with get_conn(db_path) as conn:
         rows = conn.execute(
