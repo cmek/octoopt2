@@ -22,6 +22,7 @@ octoopt2 = "octoopt2.main:main"
 octoopt2-setup = "scripts.setup:main"
 octoopt2-preload-consumption = "scripts.preload_consumption:main"
 octoopt2-report = "scripts.report:main"
+octoopt2-accuracy-report = "scripts.accuracy_report:main"
 
 [build-system]
 requires = ["hatchling"]
