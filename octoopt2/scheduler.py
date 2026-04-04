@@ -257,13 +257,15 @@ def _print_dry_run(result, inputs, now: datetime, config: AppConfig, manage_dhw:
             reg = _kw_to_register(discharge_kw, config.battery.max_discharge_rate_kw)
             if d.grid_export_kwh > 0.05:
                 print(f"    Inverter : DISCHARGE/EXPORT at {discharge_kw:.2f} kW")
+                print(f"               set_discharge_slot_1(00:00–23:59)")
                 print(f"               set_battery_discharge_limit({reg})  [{reg}/50 = {discharge_kw:.2f} kW]")
-                print(f"               set_battery_discharge_mode_max_power()")
+                print(f"               set_discharge_mode_max_power()")
             else:
                 print(f"    Inverter : DISCHARGE/DEMAND at {discharge_kw:.2f} kW")
+                print(f"               set_discharge_slot_1(00:00–23:59)")
                 print(f"               set_battery_discharge_limit({reg})  [{reg}/50 = {discharge_kw:.2f} kW]")
-                print(f"               set_battery_discharge_mode_demand()")
-            print(f"               set_discharge_enable(True) + disable_charge()")
+                print(f"               set_discharge_mode_to_match_demand()")
+            print(f"               enable_discharge() + disable_charge()")
         else:
             print(f"    Inverter : ECO — set_mode_dynamic()")
         if manage_dhw:
