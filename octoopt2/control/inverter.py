@@ -64,7 +64,7 @@ def _cmds_discharge(discharge_kw: float, battery: BatteryConfig, export: bool) -
     mode = "EXPORT" if export else "DEMAND"
     logger.info("Inverter → DISCHARGE/%s %.2f kW (register %d)", mode, discharge_kw, limit)
     reqs = [
-        *commands.set_discharge_slot_1((dt_time(0, 0), dt_time(23, 59))),
+        *commands.set_discharge_slot_1(TimeSlot(start=dt_time(0, 0), end=dt_time(23, 59))),
         *commands.set_battery_discharge_limit(limit),
     ]
     if export:
