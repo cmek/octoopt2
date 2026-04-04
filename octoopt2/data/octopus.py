@@ -97,6 +97,14 @@ def fetch_and_store_prices(
         api_key=config.api_key,
     )
 
+    if not sell_rates:
+        logger.warning(
+            "No sell rates returned for %s — check OCTOPUS_OUTGOING_TARIFF_CODE in .env "
+            "(tariff: %s)",
+            for_date,
+            config.outgoing_tariff_code,
+        )
+
     # Index sell rates by slot start for O(1) lookup
     sell_by_slot: dict[str, float] = {
         _normalise_slot(r["valid_from"]): r["value_inc_vat"] / 100
