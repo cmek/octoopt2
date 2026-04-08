@@ -8,7 +8,7 @@ load_dotenv()
 @dataclass(frozen=True)
 class BatteryConfig:
     capacity_kwh: float = 9.5
-    min_soc_pct: float = 12.0
+    min_soc_pct: float = 4.0
     max_soc_pct: float = 100.0
     # Round-trip efficiency 93% → split symmetrically: √0.93
     charge_efficiency: float = 0.9644
