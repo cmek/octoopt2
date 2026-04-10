@@ -123,16 +123,30 @@ def fetch_and_store_prices(
         return 0
 
     with get_conn(db_path) as conn:
-        conn.executemany(
-            """
-            INSERT INTO prices (slot_start, buy_gbp_kwh, sell_gbp_kwh)
-            VALUES (?, ?, ?)
-            ON CONFLICT(slot_start) DO UPDATE SET
-                buy_gbp_kwh  = excluded.buy_gbp_kwh,
-                sell_gbp_kwh = excluded.sell_gbp_kwh
-            """,
-            rows,
-        )
+        if sell_rates:
+            # Both buy and sell available — upsert everything
+            conn.executemany(
+                """
+                INSERT INTO prices (slot_start, buy_gbp_kwh, sell_gbp_kwh)
+                VALUES (?, ?, ?)
+                ON CONFLICT(slot_start) DO UPDATE SET
+                    buy_gbp_kwh  = excluded.buy_gbp_kwh,
+                    sell_gbp_kwh = excluded.sell_gbp_kwh
+                """,
+                rows,
+            )
+        else:
+            # Sell rates not yet published — only upsert buy price, preserve
+            # any sell price already stored so we don't overwrite with 0.0
+            conn.executemany(
+                """
+                INSERT INTO prices (slot_start, buy_gbp_kwh, sell_gbp_kwh)
+                VALUES (?, ?, 0.0)
+                ON CONFLICT(slot_start) DO UPDATE SET
+                    buy_gbp_kwh = excluded.buy_gbp_kwh
+                """,
+                [(slot, buy) for slot, buy, _ in rows],
+            )
 
     logger.info("Stored %d price slots for %s", len(rows), for_date)
     return len(rows)
