@@ -185,18 +185,29 @@ def get_prices_from(
 
 
 def missing_price_dates(db_path: str, look_ahead_days: int = 2) -> list[date]:
-    """Return dates within the next look_ahead_days that have no price data."""
+    """Return dates within the next look_ahead_days that need a price fetch.
+
+    A date needs fetching if:
+    - it has no buy prices at all, OR
+    - it has buy prices but all sell prices are 0.0 (fetched before sell rates
+      were published, or before the correct outgoing tariff was configured)
+    """
     today = datetime.now(LONDON).date()
     missing = []
     for offset in range(look_ahead_days):
         d = today + timedelta(days=offset)
         period_from, period_to = _agile_window(d)
         with get_conn(db_path) as conn:
-            count = conn.execute(
-                "SELECT COUNT(*) FROM prices WHERE slot_start >= ? AND slot_start < ?",
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN sell_gbp_kwh > 0 THEN 1 ELSE 0 END) AS with_sell
+                FROM prices
+                WHERE slot_start >= ? AND slot_start < ?
+                """,
                 (period_from.isoformat(), period_to.isoformat()),
-            ).fetchone()[0]
-        if count == 0:
+            ).fetchone()
+        if row["total"] == 0 or row["with_sell"] == 0:
             missing.append(d)
     return missing
 
