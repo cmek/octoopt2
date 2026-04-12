@@ -467,9 +467,8 @@ def _apply_safe_fallback(config: AppConfig) -> None:
     """Apply a safe state when the optimizer cannot run: eco mode, DHW off."""
     logger.info("Applying safe fallback: eco mode, DHW off")
     try:
-        from givenergy_modbus.client import GivEnergyClient
-        client = GivEnergyClient(host=config.givenergy.host, port=config.givenergy.port)
-        client.set_mode_dynamic()
+        from .control.inverter import _run_with_retry, _cmds_eco
+        _run_with_retry(config.givenergy, _cmds_eco())
     except Exception as exc:
         logger.error("Safe fallback inverter command failed: %s", exc)
 
