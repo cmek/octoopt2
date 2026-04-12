@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>octoopt2 — Accuracy</title>
+<style>
+:root {
+  --bg:       #0f172a;
+  --surface:  #1e293b;
+  --surface2: #293548;
+  --border:   #334155;
+  --text:     #f1f5f9;
+  --muted:    #94a3b8;
+  --green:    #22c55e;
+  --red:      #ef4444;
+  --blue:     #60a5fa;
+  --orange:   #fb923c;
+  --amber:    #fbbf24;
+  --purple:   #a78bfa;
+  --teal:     #2dd4bf;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, monospace; font-size: 13px; min-height: 100vh; }
+a { color: var(--blue); text-decoration: none; }
+.page { max-width: 1200px; margin: 0 auto; padding: 16px; }
+
+header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 0 16px; border-bottom: 1px solid var(--border); margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+header h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
+.header-right { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+/* ── Date navigation ── */
+.date-nav {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 14px; margin-bottom: 16px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.date-nav-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+.nav-btn {
+  background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+  padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+.nav-btn:hover { background: var(--border); }
+.nav-btn:disabled { opacity: 0.35; cursor: default; pointer-events: none; }
+.date-select {
+  background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+  padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer;
+}
+.nav-info { color: var(--muted); font-size: 11px; }
+
+/* ── Sections ── */
+.section { margin-bottom: 22px; }
+.section-title {
+  font-size: 12px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.5px;
+  padding: 0 0 7px; border-bottom: 1px solid var(--border); margin-bottom: 10px;
+}
+
+/* ── Summary bar ── */
+.summary-bar {
+  display: flex; gap: 20px; flex-wrap: wrap;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 14px; margin-bottom: 10px;
+}
+.stat { display: flex; flex-direction: column; }
+.stat-val { font-size: 16px; font-weight: 700; }
+.stat-lbl { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; margin-top: 2px; }
+
+/* ── Tables ── */
+.table-wrap { overflow-x: auto; border-radius: 6px; border: 1px solid var(--border); }
+table { width: 100%; border-collapse: collapse; }
+thead th {
+  background: var(--surface2); color: var(--muted);
+  padding: 7px 10px; text-align: right; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.4px; white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+thead th:first-child { text-align: left; }
+tbody tr { border-bottom: 1px solid #1e293b; }
+tbody tr:last-child { border-bottom: none; }
+tbody tr:hover { background: var(--surface2); }
+td { padding: 6px 10px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+td:first-child { text-align: left; }
+.partial { color: var(--border); font-style: italic; font-size: 11px; }
+
+/* Error magnitude classes */
+.err-good { color: var(--green); }
+.err-ok   { color: var(--amber); }
+.err-bad  { color: var(--red); }
+
+/* ── Footer ── */
+footer { margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px; }
+
+/* ── States ── */
+.state-msg { text-align: center; padding: 60px 20px; color: var(--muted); }
+.state-msg h2 { font-size: 18px; margin-bottom: 8px; color: var(--text); }
+.state-msg code { background: var(--surface2); padding: 2px 6px; border-radius: 3px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <h1>octoopt2</h1>
+    <a href="index.html" style="font-size:12px;color:var(--muted)">← Schedule</a>
+    <span style="color:var(--muted);font-size:13px">Accuracy Report</span>
+    <div class="header-right" id="report-meta"></div>
+  </header>
+
+  <div class="date-nav" id="date-nav" style="display:none">
+    <span class="date-nav-label">Report</span>
+    <button class="nav-btn" id="btn-older" onclick="navigate(1)">◀ Older</button>
+    <select class="date-select" id="date-select" onchange="loadReport(this.value)"></select>
+    <button class="nav-btn" id="btn-newer" onclick="navigate(-1)">Newer ▶</button>
+    <span class="nav-info" id="nav-info"></span>
+  </div>
+
+  <div id="app"><div class="state-msg"><h2>Loading…</h2></div></div>
+
+  <footer>
+    <span>octoopt2 energy optimizer</span>
+    <span>Run <code>uv run octoopt2-accuracy-report --output</code> daily to generate reports</span>
+  </footer>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let availableDates = [];  // sorted newest-first
+let currentDate = null;
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+function fmtKwh(v) { return v == null ? '—' : v.toFixed(2) + ' kWh'; }
+function fmtGBP(v) { return v == null ? '—' : (v < 0 ? '−' : '+') + '£' + Math.abs(v).toFixed(2); }
+function fmtPence(v) { return v == null ? '—' : (v < 0 ? '' : '+') + (v * 100).toFixed(1) + 'p'; }
+function fmtPct(v)  { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
+
+// Error magnitude: thresholds are [good_max, ok_max] — above ok_max = bad
+function errMagClass(abs_val, t1, t2) {
+  if (abs_val < t1) return 'err-good';
+  if (abs_val < t2) return 'err-ok';
+  return 'err-bad';
+}
+
+// ── Section renderers ─────────────────────────────────────────────────────────
+
+function renderForecastSection(section, errthr) {
+  // errthr: [good_kwh, ok_kwh, good_pct, ok_pct]
+  if (!section || !section.rows || !section.rows.length) {
+    return '<p style="color:var(--muted);padding:10px 0">No data available.</p>';
+  }
+
+  const s = section.summary;
+  let summHtml = '';
+  if (s) {
+    const biasDir  = s.bias > 0 ? 'over-predicts' : 'under-predicts';
+    const biasSign = s.bias >= 0 ? '+' : '';
+    const biasCol  = Math.abs(s.bias) < errthr[0] ? 'var(--green)' : Math.abs(s.bias) < errthr[1] ? 'var(--amber)' : 'var(--red)';
+    summHtml = `
+      <div class="summary-bar">
+        <div class="stat">
+          <span class="stat-val">${s.n_days}</span>
+          <span class="stat-lbl">Days with data</span>
+        </div>
+        <div class="stat">
+          <span class="stat-val ${errMagClass(s.mae, errthr[0], errthr[1])}">${s.mae.toFixed(2)} kWh</span>
+          <span class="stat-lbl">MAE / day</span>
+        </div>
+        <div class="stat">
+          <span class="stat-val" style="color:${biasCol}">${biasSign}${s.bias.toFixed(2)} kWh</span>
+          <span class="stat-lbl">Bias / day · ${biasDir}</span>
+        </div>
+      </div>`;
+  }
+
+  let rows = '';
+  for (const r of section.rows) {
+    if (r.partial) {
+      const tag = r.slots > 0 ? '(partial)' : '(no data)';
+      rows += `<tr>
+        <td>${r.label}</td>
+        <td class="partial" colspan="5">${tag} — ${r.slots} slots recorded</td>
+      </tr>`;
+    } else {
+      const errAbs = Math.abs(r.error_kwh);
+      const pctAbs = Math.abs(r.error_pct);
+      rows += `<tr>
+        <td>${r.label}</td>
+        <td>${r.forecast_kwh.toFixed(2)} kWh</td>
+        <td>${r.actual_kwh.toFixed(2)} kWh</td>
+        <td class="${errMagClass(errAbs, errthr[0], errthr[1])}">${r.error_kwh >= 0 ? '+' : ''}${r.error_kwh.toFixed(2)} kWh</td>
+        <td class="${errMagClass(pctAbs, errthr[2], errthr[3])}">${fmtPct(r.error_pct)}</td>
+        <td style="color:var(--muted)">${r.slots}</td>
+      </tr>`;
+    }
+  }
+
+  return `${summHtml}
+    <div class="table-wrap"><table>
+      <thead><tr>
+        <th>Date</th><th>Forecast</th><th>Actual</th>
+        <th>Error</th><th>Error %</th><th>Slots</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+}
+
+function renderCostSection(section) {
+  if (!section || !section.rows || !section.rows.length) {
+    return '<p style="color:var(--muted);padding:10px 0">No data available.</p>';
+  }
+
+  const s = section.summary;
+  let summHtml = '';
+  if (s) {
+    const diffDir = s.total_diff_gbp < 0 ? 'cheaper than planned' : 'more expensive than planned';
+    const diffCol = s.total_diff_gbp < 0 ? 'var(--green)' : 'var(--red)';
+    summHtml = `
+      <div class="summary-bar">
+        <div class="stat">
+          <span class="stat-val">${s.n_days}</span>
+          <span class="stat-lbl">Days with data</span>
+        </div>
+        <div class="stat">
+          <span class="stat-val" style="color:var(--muted)">${fmtGBP(s.total_planned_gbp)}</span>
+          <span class="stat-lbl">Total planned</span>
+        </div>
+        <div class="stat">
+          <span class="stat-val" style="color:var(--muted)">${fmtGBP(s.total_actual_gbp)}</span>
+          <span class="stat-lbl">Total actual</span>
+        </div>
+        <div class="stat">
+          <span class="stat-val" style="color:${diffCol}">${fmtGBP(s.total_diff_gbp)}</span>
+          <span class="stat-lbl">${diffDir}</span>
+        </div>
+        <div class="stat">
+          <span class="stat-val" style="color:var(--red)">${s.total_import_kwh.toFixed(1)} kWh</span>
+          <span class="stat-lbl">Total import</span>
+        </div>
+        <div class="stat">
+          <span class="stat-val" style="color:var(--blue)">${s.total_export_kwh.toFixed(1)} kWh</span>
+          <span class="stat-lbl">Total export</span>
+        </div>
+      </div>`;
+  }
+
+  let rows = '';
+  for (const r of section.rows) {
+    if (r.partial) {
+      const tag = r.slots > 0 ? '(partial)' : '(no data)';
+      rows += `<tr>
+        <td>${r.label}</td>
+        <td class="partial" colspan="6">${tag} — ${r.slots} slots recorded</td>
+      </tr>`;
+    } else {
+      const diffCol = r.diff_gbp < -0.005 ? 'var(--green)' : r.diff_gbp > 0.005 ? 'var(--red)' : 'var(--muted)';
+      rows += `<tr>
+        <td>${r.label}</td>
+        <td style="color:var(--muted)">${(r.planned_gbp * 100).toFixed(1)}p</td>
+        <td style="color:var(--muted)">${(r.actual_gbp * 100).toFixed(1)}p</td>
+        <td style="color:${diffCol}">${r.diff_gbp >= 0 ? '+' : ''}${(r.diff_gbp * 100).toFixed(1)}p</td>
+        <td style="color:var(--red)">${r.import_kwh.toFixed(2)} kWh</td>
+        <td style="color:var(--blue)">${r.export_kwh.toFixed(2)} kWh</td>
+        <td style="color:var(--muted)">${r.slots}</td>
+      </tr>`;
+    }
+  }
+
+  return `${summHtml}
+    <div class="table-wrap"><table>
+      <thead><tr>
+        <th>Date</th><th>Planned</th><th>Actual</th>
+        <th>Diff</th><th>Import</th><th>Export</th><th>Slots</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+}
+
+function render(data) {
+  const genAt = new Date(data.generated_at).toLocaleString('en-GB', {
+    timeZone: 'Europe/London', day: 'numeric', month: 'short',
+    hour: '2-digit', minute: '2-digit',
+  });
+  document.getElementById('report-meta').textContent =
+    `${data.days} days ending ${data.report_date} · Generated ${genAt}`;
+
+  // Solar: good <1 kWh / <10%, ok <2.5 kWh / <25%
+  // Load:  good <0.5 kWh / <8%,  ok <1.5 kWh / <20%
+  document.getElementById('app').innerHTML = `
+    <div class="section">
+      <div class="section-title">Solar forecast accuracy &nbsp;·&nbsp; Solcast p50 vs inverter actual</div>
+      ${renderForecastSection(data.solar, [1.0, 2.5, 10, 25])}
+    </div>
+    <div class="section">
+      <div class="section-title">Load forecast accuracy &nbsp;·&nbsp; Optimizer prediction vs inverter actual</div>
+      ${renderForecastSection(data.load, [0.5, 1.5, 8, 20])}
+    </div>
+    <div class="section">
+      <div class="section-title">Cost outcomes &nbsp;·&nbsp; Planned schedule cost vs actual</div>
+      ${renderCostSection(data.cost)}
+    </div>`;
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+
+function navigate(dir) {
+  // availableDates sorted newest-first; dir=1 → go older (higher index), dir=-1 → go newer
+  const idx = availableDates.indexOf(currentDate);
+  const next = idx + dir;
+  if (next >= 0 && next < availableDates.length) {
+    loadReport(availableDates[next]);
+  }
+}
+
+function updateNav() {
+  const idx = availableDates.indexOf(currentDate);
+  document.getElementById('btn-older').disabled = idx >= availableDates.length - 1;
+  document.getElementById('btn-newer').disabled = idx <= 0;
+  document.getElementById('nav-info').textContent =
+    availableDates.length ? `${idx + 1} of ${availableDates.length}` : '';
+  document.getElementById('date-select').value = currentDate;
+}
+
+function loadReport(date) {
+  currentDate = date;
+  updateNav();
+  document.getElementById('app').innerHTML = '<div class="state-msg"><h2>Loading…</h2></div>';
+  document.getElementById('report-meta').textContent = '';
+
+  fetch(`reports/${date}.json?t=` + Date.now())
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(data => render(data))
+    .catch(err => {
+      document.getElementById('app').innerHTML = `
+        <div class="state-msg">
+          <h2>No report for ${date}</h2>
+          <p style="color:var(--muted);margin-top:8px">${err}</p>
+        </div>`;
+    });
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+
+fetch('reports/index.json?t=' + Date.now())
+  .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+  .then(idx => {
+    availableDates = (idx.reports || []).slice().sort().reverse();
+
+    if (!availableDates.length) {
+      document.getElementById('app').innerHTML = `
+        <div class="state-msg">
+          <h2>No reports yet</h2>
+          <p>Run <code>uv run octoopt2-accuracy-report --output</code> to generate the first report.</p>
+        </div>`;
+      return;
+    }
+
+    const sel = document.getElementById('date-select');
+    availableDates.forEach(d => {
+      const opt = document.createElement('option');
+      opt.value = d; opt.textContent = d;
+      sel.appendChild(opt);
+    });
+
+    document.getElementById('date-nav').style.display = 'flex';
+    loadReport(availableDates[0]);
+  })
+  .catch(err => {
+    document.getElementById('app').innerHTML = `
+      <div class="state-msg">
+        <h2>No reports found</h2>
+        <p>Run <code>uv run octoopt2-accuracy-report --output</code> to generate reports.</p>
+        <p style="margin-top:8px;color:#64748b;font-size:11px">${err}</p>
+      </div>`;
+  });
+</script>
+</body>
+</html>

@@ -9,9 +9,12 @@ window of days, showing:
 Usage:
     uv run octoopt2-accuracy-report
     uv run octoopt2-accuracy-report --days 30
+    uv run octoopt2-accuracy-report --output          # save web/reports/YYYY-MM-DD.json
     uv run python scripts/accuracy_report.py --days 14
 """
 import argparse
+import json
+import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -275,6 +278,145 @@ def report_cost(data: dict, days: list[str]) -> None:
         print("  Insufficient data for summary statistics.")
 
 
+# ── JSON builders (for --output / web) ───────────────────────────────────────
+
+def _build_solar_json(data: dict, days: list[str]) -> dict:
+    rows = []
+    errors, biases = [], []
+    for day in days:
+        fc  = data["forecast"].get(day, {}).get("pv_estimate_kwh")
+        act = data["actual"].get(day, {}).get("solar_kwh")
+        cnt = data["actual_cnt"].get(day, 0)
+        if fc is None or act is None or cnt < 10:
+            rows.append({"day": day, "label": _day_label(day), "slots": cnt, "partial": True})
+            continue
+        err = fc - act
+        pct = err / act * 100 if act > 0 else 0.0
+        errors.append(abs(err))
+        biases.append(err)
+        rows.append({
+            "day": day, "label": _day_label(day),
+            "forecast_kwh": round(fc, 3), "actual_kwh": round(act, 3),
+            "error_kwh": round(err, 3), "error_pct": round(pct, 1),
+            "slots": cnt, "partial": False,
+        })
+    result: dict = {"rows": rows}
+    if len(errors) >= 2:
+        result["summary"] = {
+            "n_days": len(errors),
+            "mae": round(sum(errors) / len(errors), 3),
+            "bias": round(sum(biases) / len(biases), 3),
+        }
+    return result
+
+
+def _build_load_json(data: dict, days: list[str]) -> dict:
+    rows = []
+    errors, biases = [], []
+    for day in days:
+        fc  = data["schedule"].get(day, {}).get("predicted_load_kwh")
+        act = data["actual"].get(day, {}).get("load_kwh")
+        cnt = data["actual_cnt"].get(day, 0)
+        if fc is None or act is None or cnt < 10:
+            rows.append({"day": day, "label": _day_label(day), "slots": cnt, "partial": True})
+            continue
+        err = fc - act
+        pct = err / act * 100 if act > 0 else 0.0
+        errors.append(abs(err))
+        biases.append(err)
+        rows.append({
+            "day": day, "label": _day_label(day),
+            "forecast_kwh": round(fc, 3), "actual_kwh": round(act, 3),
+            "error_kwh": round(err, 3), "error_pct": round(pct, 1),
+            "slots": cnt, "partial": False,
+        })
+    result: dict = {"rows": rows}
+    if len(errors) >= 2:
+        result["summary"] = {
+            "n_days": len(errors),
+            "mae": round(sum(errors) / len(errors), 3),
+            "bias": round(sum(biases) / len(biases), 3),
+        }
+    return result
+
+
+def _build_cost_json(data: dict, days: list[str]) -> dict:
+    rows = []
+    totals: dict[str, float] = {"planned": 0.0, "actual": 0.0, "imp": 0.0, "exp": 0.0}
+    n = 0
+    for day in days:
+        planned = data["planned_cost"].get(day)
+        actual  = data["actual"].get(day, {}).get("cost_gbp")
+        imp     = data["actual"].get(day, {}).get("grid_import_kwh", 0.0)
+        exp     = data["actual"].get(day, {}).get("grid_export_kwh", 0.0)
+        cnt     = data["actual_cnt"].get(day, 0)
+        if planned is None or actual is None or cnt < 10:
+            rows.append({"day": day, "label": _day_label(day), "slots": cnt, "partial": True})
+            continue
+        diff = actual - planned
+        totals["planned"] += planned
+        totals["actual"]  += actual
+        totals["imp"]     += imp
+        totals["exp"]     += exp
+        n += 1
+        rows.append({
+            "day": day, "label": _day_label(day),
+            "planned_gbp": round(planned, 4), "actual_gbp": round(actual, 4),
+            "diff_gbp": round(diff, 4),
+            "import_kwh": round(imp, 3), "export_kwh": round(exp, 3),
+            "slots": cnt, "partial": False,
+        })
+    result: dict = {"rows": rows}
+    if n >= 2:
+        result["summary"] = {
+            "n_days": n,
+            "total_planned_gbp": round(totals["planned"], 4),
+            "total_actual_gbp":  round(totals["actual"], 4),
+            "total_diff_gbp":    round(totals["actual"] - totals["planned"], 4),
+            "total_import_kwh":  round(totals["imp"], 3),
+            "total_export_kwh":  round(totals["exp"], 3),
+        }
+    return result
+
+
+def _save_web_output(config, today_london: datetime, n_days: int, data: dict, days: list[str]) -> None:
+    """Save timestamped JSON report and update the index."""
+    report_date = (today_london - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    payload = {
+        "report_date": report_date,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "days": n_days,
+        "solar": _build_solar_json(data, days),
+        "load":  _build_load_json(data, days),
+        "cost":  _build_cost_json(data, days),
+    }
+
+    web_dir = os.path.join("web", "reports")
+    os.makedirs(web_dir, exist_ok=True)
+
+    out_path = os.path.join(web_dir, f"{report_date}.json")
+    with open(out_path, "w") as f:
+        json.dump(payload, f)
+    print(f"\nSaved report to {out_path}")
+
+    # Update index
+    index_path = os.path.join(web_dir, "index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+    else:
+        index = {"reports": []}
+
+    if report_date not in index["reports"]:
+        index["reports"].append(report_date)
+        index["reports"].sort(reverse=True)
+
+    with open(index_path, "w") as f:
+        json.dump(index, f)
+    print(f"Updated index: {len(index['reports'])} report(s) available")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -282,6 +424,10 @@ def main() -> None:
     parser.add_argument(
         "--days", type=int, default=14,
         help="Number of past days to include (default: 14)",
+    )
+    parser.add_argument(
+        "--output", action="store_true",
+        help="Save report as web/reports/YYYY-MM-DD.json and update web/reports/index.json",
     )
     args = parser.parse_args()
 
@@ -316,6 +462,9 @@ def main() -> None:
     report_load(data, days)
     report_cost(data, days)
     print()
+
+    if args.output:
+        _save_web_output(config, today_london, args.days, data, days)
 
 
 if __name__ == "__main__":
