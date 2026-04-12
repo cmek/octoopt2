@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>octoopt2</title>
+<style>
+:root {
+  --bg:       #0f172a;
+  --surface:  #1e293b;
+  --surface2: #293548;
+  --border:   #334155;
+  --text:     #f1f5f9;
+  --muted:    #94a3b8;
+  --green:    #22c55e;
+  --red:      #ef4444;
+  --blue:     #60a5fa;
+  --orange:   #fb923c;
+  --amber:    #fbbf24;
+  --purple:   #a78bfa;
+  --teal:     #2dd4bf;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, monospace; font-size: 13px; min-height: 100vh; }
+
+a { color: var(--blue); text-decoration: none; }
+
+/* ── Layout ── */
+.page { max-width: 1400px; margin: 0 auto; padding: 16px; }
+
+header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 0 16px; border-bottom: 1px solid var(--border); margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+header h1 { font-size: 18px; font-weight: 700; color: var(--text); letter-spacing: -0.3px; }
+.badge {
+  padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.badge-optimal  { background: #14532d; color: var(--green); }
+.badge-infeasible { background: #7f1d1d; color: var(--red); }
+.badge-loading  { background: #1e3a5f; color: var(--blue); }
+.header-right { margin-left: auto; display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; }
+.refresh-btn {
+  background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+  padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+.refresh-btn:hover { background: var(--border); }
+
+/* ── Summary cards ── */
+.cards { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 14px; flex: 1; min-width: 140px;
+}
+.card-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+.card-value { font-size: 20px; font-weight: 700; }
+.card-sub   { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.cost-positive { color: var(--red); }
+.cost-negative { color: var(--green); }
+.cost-zero     { color: var(--muted); }
+
+/* ── Yesterday bar ── */
+.yesterday-bar {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 14px; margin-bottom: 16px;
+  display: flex; gap: 20px; flex-wrap: wrap; align-items: center;
+}
+.yesterday-bar .yday-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+.yday-stat { display: flex; flex-direction: column; }
+.yday-stat span:first-child { font-size: 15px; font-weight: 600; }
+.yday-stat span:last-child  { color: var(--muted); font-size: 10px; }
+.yday-sep { color: var(--border); }
+
+/* ── DHW windows ── */
+.dhw-bar {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 14px; margin-bottom: 16px;
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+}
+.dhw-bar .dhw-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+.dhw-window {
+  background: #14532d; color: var(--green); padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;
+}
+.dhw-none { color: var(--muted); font-size: 12px; }
+
+/* ── Schedule table ── */
+.table-wrap { overflow-x: auto; border-radius: 6px; border: 1px solid var(--border); }
+table { width: 100%; border-collapse: collapse; }
+thead th {
+  background: var(--surface2); color: var(--muted);
+  padding: 7px 8px; text-align: right; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.4px; white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+thead th:first-child { text-align: left; }
+tbody tr { border-bottom: 1px solid #1e293b; }
+tbody tr:last-child { border-bottom: none; }
+tbody tr:hover { background: var(--surface2); }
+tbody tr.current { background: #1e3a5f; border-left: 3px solid var(--blue); }
+tbody tr.current:hover { background: #1e3a5f; }
+td {
+  padding: 5px 8px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+td:first-child { text-align: left; }
+.now-marker { color: var(--blue); font-size: 10px; font-weight: 600; margin-left: 4px; }
+
+/* Price cells */
+.price-cell { font-weight: 600; padding: 3px 6px; border-radius: 3px; }
+
+/* Mode badges */
+.mode { padding: 2px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.mode-charge   { background: #1e3a5f; color: var(--blue); }
+.mode-exp      { background: #431407; color: var(--orange); }
+.mode-demand   { background: #422006; color: var(--amber); }
+.mode-eco      { background: #1e293b; color: var(--muted); }
+
+/* DHW cell */
+.dhw-on  { color: var(--green); font-weight: 600; }
+.dhw-off { color: var(--border); }
+
+/* Slot cost */
+.sc-pos { color: var(--red); }
+.sc-neg { color: var(--green); }
+.sc-zero { color: var(--muted); }
+
+/* SoC bar */
+.soc-wrap { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
+.soc-bar-bg { width: 40px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; flex-shrink: 0; }
+.soc-bar-fill { height: 100%; border-radius: 3px; }
+
+/* ── Footer ── */
+footer { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; display: flex; justify-content: space-between; }
+
+/* ── Error / loading states ── */
+.state-msg { text-align: center; padding: 60px 20px; color: var(--muted); }
+.state-msg h2 { font-size: 18px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>octoopt2</h1>
+    <span id="status-badge" class="badge badge-loading">loading</span>
+    <span id="header-cost" style="font-size:13px;color:var(--muted)"></span>
+    <div class="header-right">
+      <span id="generated-at"></span>
+      <span id="refresh-countdown"></span>
+      <button class="refresh-btn" onclick="loadData()">↻ Refresh</button>
+    </div>
+  </header>
+
+  <div id="app"><div class="state-msg"><h2>Loading…</h2></div></div>
+
+  <footer>
+    <span>octoopt2 energy optimizer</span>
+    <span id="footer-note">Auto-refreshes every 5 minutes</span>
+  </footer>
+</div>
+
+<script>
+// ── Utilities ────────────────────────────────────────────────────────────────
+
+function fmt(v, dec=2) { return v == null ? '—' : v.toFixed(dec); }
+function fmtP(p) { return p == null ? '—' : (p >= 0 ? '+' : '') + p.toFixed(2) + 'p'; }
+function fmtK(k) { return k == null ? '—' : k.toFixed(3); }
+
+function priceStyle(p) {
+  // p in pence/kWh — returns inline background+color style string
+  if (p == null) return '';
+  if (p < 0)   return 'background:#2e1065;color:#c4b5fd';
+  if (p < 5)   return 'background:#14532d;color:#86efac';
+  if (p < 12)  return 'background:#166534;color:#bbf7d0';
+  if (p < 20)  return 'background:#365314;color:#d9f99d';
+  if (p < 28)  return 'background:#713f12;color:#fed7aa';
+  if (p < 36)  return 'background:#7c2d12;color:#fdba74';
+  return               'background:#7f1d1d;color:#fca5a5';
+}
+
+function costClass(v) {
+  if (Math.abs(v) < 0.0005) return 'sc-zero';
+  return v < 0 ? 'sc-neg' : 'sc-pos';
+}
+
+function socColor(pct) {
+  if (pct <= 20) return '#ef4444';
+  if (pct <= 40) return '#f97316';
+  if (pct <= 70) return '#22c55e';
+  return '#60a5fa';
+}
+
+function modeClass(mode) {
+  if (mode.startsWith('CHARGE'))            return 'mode-charge';
+  if (mode.includes('EXPORT'))              return 'mode-exp';
+  if (mode.includes('DEMAND'))              return 'mode-demand';
+  return 'mode-eco';
+}
+
+function formatTime(isoStr) {
+  // ISO UTC → UK local HH:MM
+  return new Date(isoStr).toLocaleTimeString('en-GB', {
+    hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London'
+  });
+}
+
+function formatDateTime(isoStr) {
+  return new Date(isoStr).toLocaleString('en-GB', {
+    day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+    timeZone: 'Europe/London'
+  });
+}
+
+// ── DHW window merging ───────────────────────────────────────────────────────
+
+function dhwWindows(slots) {
+  const on = slots.filter(s => s.dhw_on).map(s => new Date(s.slot_start).getTime());
+  if (!on.length) return [];
+  on.sort((a, b) => a - b);
+  const windows = [];
+  let start = on[0], end = on[0];
+  for (let i = 1; i < on.length; i++) {
+    if (on[i] - end <= 30 * 60 * 1000) { end = on[i]; }
+    else { windows.push([start, end]); start = end = on[i]; }
+  }
+  windows.push([start, end]);
+  return windows.map(([s, e]) => {
+    const ts = new Date(s).toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit', timeZone:'Europe/London' });
+    const te = new Date(e + 30*60*1000).toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit', timeZone:'Europe/London' });
+    return `${ts}–${te}`;
+  });
+}
+
+// ── Render ───────────────────────────────────────────────────────────────────
+
+function render(data) {
+  const slots = data.schedule || [];
+  const cap   = data.battery_capacity_kwh || 9.5;
+
+  // Header
+  const statusEl = document.getElementById('status-badge');
+  statusEl.textContent = data.solver_status || 'Unknown';
+  statusEl.className = 'badge ' + (data.solver_status === 'Optimal' ? 'badge-optimal' : 'badge-infeasible');
+
+  const cost = data.total_cost_gbp;
+  document.getElementById('header-cost').textContent =
+    `Net: ${cost < 0 ? '−' : '+'}£${Math.abs(cost).toFixed(2)}`;
+
+  document.getElementById('generated-at').textContent =
+    'Updated ' + formatDateTime(data.generated_at);
+
+  // Summary cards
+  const totalSolar  = slots.reduce((a, s) => a + s.solar_kwh, 0);
+  const totalImport = slots.reduce((a, s) => a + s.grid_import_kwh, 0);
+  const totalExport = slots.reduce((a, s) => a + s.grid_export_kwh, 0);
+  const currentSlot = slots.find(s => s.is_current);
+  const socNow      = currentSlot ? currentSlot.soc_pct : null;
+  const dhwCount    = slots.filter(s => s.dhw_on).length;
+
+  const costClass2 = cost < -0.0005 ? 'cost-negative' : cost > 0.0005 ? 'cost-positive' : 'cost-zero';
+  const costSign   = cost < 0 ? '−' : '+';
+
+  let cards = `
+    <div class="card">
+      <div class="card-label">Net cost (window)</div>
+      <div class="card-value ${costClass2}">${costSign}£${Math.abs(cost).toFixed(2)}</div>
+      <div class="card-sub">${slots.length} slots · ${data.solver_status}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Battery SoC</div>
+      <div class="card-value" style="color:${socNow != null ? socColor(socNow) : 'inherit'}">${socNow != null ? socNow.toFixed(1) + '%' : '—'}</div>
+      <div class="card-sub">${currentSlot ? currentSlot.soc_kwh.toFixed(2) + ' kWh of ' + cap.toFixed(1) + ' kWh' : ''}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Solar forecast</div>
+      <div class="card-value" style="color:var(--amber)">${totalSolar.toFixed(1)} kWh</div>
+      <div class="card-sub">Import ${totalImport.toFixed(1)} · Export ${totalExport.toFixed(1)} kWh</div>
+    </div>`;
+
+  if (data.manage_dhw) {
+    cards += `
+    <div class="card">
+      <div class="card-label">DHW heating</div>
+      <div class="card-value" style="color:var(--teal)">${dhwCount} slots</div>
+      <div class="card-sub">${(dhwCount * 0.5).toFixed(1)} hours planned</div>
+    </div>`;
+  }
+
+  // Yesterday bar
+  let ydayHtml = '';
+  const y = data.yesterday;
+  if (y) {
+    const nc = y.net_cost_gbp;
+    const ncStyle = nc < 0 ? 'color:var(--green)' : 'color:var(--red)';
+    ydayHtml = `
+      <div class="yesterday-bar">
+        <span class="yday-title">Yesterday · ${y.label}</span>
+        <span class="yday-sep">|</span>
+        <div class="yday-stat"><span style="color:var(--amber)">${y.solar_kwh.toFixed(1)} kWh</span><span>Solar</span></div>
+        <div class="yday-stat"><span>${y.load_kwh.toFixed(1)} kWh</span><span>Load</span></div>
+        <div class="yday-stat"><span style="color:var(--red)">${y.import_kwh.toFixed(1)} kWh</span><span>Import</span></div>
+        <div class="yday-stat"><span style="color:var(--blue)">${y.export_kwh.toFixed(1)} kWh</span><span>Export</span></div>
+        <div class="yday-stat"><span style="${ncStyle}">${nc < 0 ? '−' : '+'}£${Math.abs(nc).toFixed(2)}</span><span>Net cost</span></div>
+        <div class="yday-stat"><span style="color:var(--muted)">${y.slots}/48</span><span>Slots</span></div>
+      </div>`;
+  }
+
+  // DHW windows
+  let dhwHtml = '';
+  if (data.manage_dhw) {
+    const windows = dhwWindows(slots);
+    dhwHtml = `<div class="dhw-bar">
+      <span class="dhw-label">DHW windows</span>`;
+    if (windows.length) {
+      windows.forEach(w => { dhwHtml += `<span class="dhw-window">${w}</span>`; });
+    } else {
+      dhwHtml += `<span class="dhw-none">none scheduled</span>`;
+    }
+    dhwHtml += `</div>`;
+  }
+
+  // Schedule table
+  let rows = '';
+  slots.forEach(s => {
+    const rowClass = s.is_current ? 'current' : '';
+    const buyStyle  = priceStyle(s.buy_p);
+    const sellStyle = priceStyle(s.sell_p);
+    const soc = s.soc_pct;
+    const socFill = `background:${socColor(soc)};width:${Math.min(100,soc)}%`;
+    const bat = s.bat_charge_kwh > 0.005
+      ? `<span style="color:var(--blue)">+${s.bat_charge_kwh.toFixed(3)}</span>`
+      : s.bat_discharge_kwh > 0.005
+      ? `<span style="color:var(--orange)">−${s.bat_discharge_kwh.toFixed(3)}</span>`
+      : `<span style="color:var(--border)">—</span>`;
+    const dhwCell = s.dhw_on
+      ? `<span class="dhw-on">ON</span>`
+      : `<span class="dhw-off">·</span>`;
+    const sc = s.slot_cost_gbp;
+    const scHtml = `<span class="${costClass(sc)}">${Math.abs(sc) < 0.0005 ? '·' : (sc < 0 ? '−' : '+') + (Math.abs(sc)*100).toFixed(1) + 'p'}</span>`;
+    const modeHtml = `<span class="mode ${modeClass(s.mode)}">${s.mode}</span>`;
+    const nowMark  = s.is_current ? '<span class="now-marker">◄ now</span>' : '';
+
+    rows += `<tr class="${rowClass}">
+      <td>${s.time_uk}${nowMark}</td>
+      <td><span class="price-cell" style="${buyStyle}">${s.buy_p >= 0 ? '' : ''}${s.buy_p.toFixed(1)}p</span></td>
+      <td><span class="price-cell" style="${sellStyle}">${s.sell_p.toFixed(1)}p</span></td>
+      <td>${s.solar_kwh > 0.001 ? `<span style="color:var(--amber)">${s.solar_kwh.toFixed(3)}</span>` : '<span style="color:var(--border)">·</span>'}</td>
+      <td>${s.load_kwh.toFixed(3)}</td>
+      <td>${bat}</td>
+      <td>${s.grid_export_kwh > 0.005 ? `<span style="color:var(--blue)">${s.grid_export_kwh.toFixed(3)}</span>` : '<span style="color:var(--border)">·</span>'}</td>
+      <td>${s.grid_import_kwh > 0.005 ? `<span style="color:var(--red)">${s.grid_import_kwh.toFixed(3)}</span>` : '<span style="color:var(--border)">·</span>'}</td>
+      <td>${dhwCell}</td>
+      <td>
+        <div class="soc-wrap">
+          ${soc.toFixed(0)}%
+          <div class="soc-bar-bg"><div class="soc-bar-fill" style="${socFill}"></div></div>
+        </div>
+      </td>
+      <td>${scHtml}</td>
+      <td>${modeHtml}</td>
+    </tr>`;
+  });
+
+  document.getElementById('app').innerHTML = `
+    <div class="cards">${cards}</div>
+    ${ydayHtml}
+    ${dhwHtml}
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Time</th><th>Buy</th><th>Sell</th>
+          <th>Solar</th><th>Load</th><th>Bat ±</th>
+          <th>Export</th><th>Import</th><th>DHW</th>
+          <th>SoC</th><th>Cost</th><th>Mode</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+
+  // Scroll current slot into view
+  const cur = document.querySelector('tr.current');
+  if (cur) cur.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+// ── Load & auto-refresh ──────────────────────────────────────────────────────
+
+let countdown = 300;
+
+function tick() {
+  countdown--;
+  const el = document.getElementById('refresh-countdown');
+  if (el) el.textContent = `Refresh in ${countdown}s`;
+  if (countdown <= 0) { countdown = 300; loadData(); }
+}
+
+function loadData() {
+  countdown = 300;
+  fetch('schedule.json?t=' + Date.now())
+    .then(r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(data => render(data))
+    .catch(err => {
+      document.getElementById('app').innerHTML = `
+        <div class="state-msg">
+          <h2>No data</h2>
+          <p>Run <code>uv run octoopt2 --output</code> to generate schedule.json</p>
+          <p style="margin-top:8px;color:#64748b;font-size:11px">${err}</p>
+        </div>`;
+      const sb = document.getElementById('status-badge');
+      sb.textContent = 'no data'; sb.className = 'badge badge-loading';
+    });
+}
+
+loadData();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

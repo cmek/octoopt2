@@ -35,7 +35,7 @@ LONDON = ZoneInfo("Europe/London")
 _FALLBACK_LOAD_KWH = 0.5
 
 
-def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True) -> None:
+def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, output: bool = False) -> None:
     """Execute one optimization tick.
 
     dry_run=True:    runs every step except writing to hardware. Prints the
@@ -123,7 +123,13 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True) -> No
         _apply_safe_fallback(config)
         return
 
-    # ── 6. Save schedule (skipped in dry-run) ────────────────────────────
+    # ── 6. Save schedule / write output ──────────────────────────────────
+    if output:
+        try:
+            _write_web_output(result, inputs, now, config, manage_dhw)
+        except Exception as exc:
+            logger.warning("Failed to write web output: %s", exc)
+
     if dry_run:
         _print_dry_run(result, inputs, now, config, manage_dhw=manage_dhw)
         return
@@ -273,6 +279,107 @@ def _print_dry_run(result, inputs, now: datetime, config: AppConfig, manage_dhw:
         else:
             print(f"    Ecodan   : DHW unmanaged (auto)")
     print()
+
+
+# ── Web output ───────────────────────────────────────────────────────────────
+
+def _write_web_output(result, inputs, now: datetime, config: AppConfig, manage_dhw: bool) -> None:
+    """Write optimizer result to web/schedule.json for the dashboard."""
+    import json
+    from pathlib import Path
+    from .control.inverter import _kw_to_register
+
+    current_slot = now.replace(minute=(now.minute // 30) * 30, second=0, microsecond=0)
+
+    slots = []
+    for t, d in enumerate(result.decisions):
+        local_time = d.slot_start.astimezone(LONDON)
+        is_current = (
+            d.slot_start.replace(tzinfo=timezone.utc)
+            == current_slot.replace(tzinfo=timezone.utc)
+        )
+        if d.battery_charge_kwh > 0.05:
+            charge_kw = d.battery_charge_kwh / 0.5
+            reg = _kw_to_register(charge_kw, config.battery.max_charge_rate_kw)
+            mode = f"CHARGE r={reg}/50"
+        elif d.battery_discharge_kwh > 0.05:
+            discharge_kw = d.battery_discharge_kwh / 0.5
+            reg = _kw_to_register(discharge_kw, config.battery.max_discharge_rate_kw)
+            mode = (
+                f"DISCHARGE/EXPORT r={reg}/50"
+                if d.grid_export_kwh > 0.05
+                else f"DISCHARGE/DEMAND r={reg}/50"
+            )
+        else:
+            mode = "ECO"
+
+        slots.append({
+            "slot_start":        d.slot_start.astimezone(timezone.utc).isoformat(),
+            "time_uk":           local_time.strftime("%a %H:%M"),
+            "buy_p":             round(inputs.buy_prices[t] * 100, 3),
+            "sell_p":            round(inputs.sell_prices[t] * 100, 3),
+            "solar_kwh":         round(inputs.solar_forecast[t], 3),
+            "load_kwh":          round(inputs.load_forecast[t], 3),
+            "bat_charge_kwh":    round(d.battery_charge_kwh, 3),
+            "bat_discharge_kwh": round(d.battery_discharge_kwh, 3),
+            "grid_export_kwh":   round(d.grid_export_kwh, 3),
+            "grid_import_kwh":   round(d.grid_import_kwh, 3),
+            "dhw_on":            d.dhw_on,
+            "soc_pct":           round(d.soc_end_kwh / config.battery.capacity_kwh * 100, 1),
+            "soc_kwh":           round(d.soc_end_kwh, 3),
+            "slot_cost_gbp":     round(d.slot_cost_gbp, 4),
+            "mode":              mode,
+            "is_current":        is_current,
+        })
+
+    # Yesterday's actuals summary
+    yesterday_summary = None
+    try:
+        now_london = now.astimezone(LONDON)
+        today_london = now_london.replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_london = today_london - timedelta(days=1)
+        today_utc = today_london.astimezone(timezone.utc)
+        yesterday_utc = yesterday_london.astimezone(timezone.utc)
+
+        with get_conn(config.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT SUM(solar_kwh) AS solar, SUM(load_kwh) AS load,
+                       SUM(grid_import_kwh) AS imp, SUM(grid_export_kwh) AS exp,
+                       SUM(cost_gbp) AS cost, COUNT(*) AS slots
+                FROM actuals WHERE slot_start >= ? AND slot_start < ?
+                """,
+                (yesterday_utc.isoformat(), today_utc.isoformat()),
+            ).fetchone()
+        if row["slots"] > 0:
+            yesterday_summary = {
+                "date":         yesterday_london.strftime("%Y-%m-%d"),
+                "label":        yesterday_london.strftime("%-d %B, %A"),
+                "solar_kwh":    round(row["solar"] or 0, 2),
+                "load_kwh":     round(row["load"]  or 0, 2),
+                "import_kwh":   round(row["imp"]   or 0, 2),
+                "export_kwh":   round(row["exp"]   or 0, 2),
+                "net_cost_gbp": round(row["cost"]  or 0, 2),
+                "slots":        row["slots"],
+            }
+    except Exception as exc:
+        logger.warning("Could not fetch yesterday's actuals for web output: %s", exc)
+
+    payload = {
+        "generated_at":   now.isoformat(),
+        "optimized_at":   result.optimized_at.isoformat(),
+        "solver_status":  result.solver_status,
+        "total_cost_gbp": round(result.total_cost_gbp, 4),
+        "manage_dhw":     manage_dhw,
+        "battery_capacity_kwh": config.battery.capacity_kwh,
+        "schedule":       slots,
+        "yesterday":      yesterday_summary,
+    }
+
+    out_path = Path("web") / "schedule.json"
+    out_path.parent.mkdir(exist_ok=True)
+    out_path.write_text(json.dumps(payload))
+    logger.info("Web output written to %s", out_path)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
