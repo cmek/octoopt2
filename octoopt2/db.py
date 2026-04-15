@@ -86,13 +86,36 @@ CREATE TABLE IF NOT EXISTS actuals (
     load_kwh         REAL,
     cost_gbp         REAL   -- negative = earned money
 );
+
+-- Last inverter command successfully applied (singleton row, id always = 1).
+-- Used to skip redundant register writes and to omit slot-time commands when
+-- the mode has not changed.
+CREATE TABLE IF NOT EXISTS inverter_last_command (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    applied_at     TEXT NOT NULL,
+    mode           TEXT NOT NULL,       -- CHARGE | DISCHARGE_DEMAND | DISCHARGE_EXPORT | ECO
+    power_register INTEGER NOT NULL,    -- charge/discharge limit register (1-50); 0 for ECO
+    total_writes   INTEGER NOT NULL DEFAULT 0  -- cumulative lifetime register writes sent
+);
 """
 
 
 def init_db(db_path: str) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply schema changes that can't be expressed as CREATE TABLE IF NOT EXISTS."""
+    # total_writes added after initial release of inverter_last_command
+    try:
+        conn.execute(
+            "ALTER TABLE inverter_last_command ADD COLUMN total_writes INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
 
 @contextmanager

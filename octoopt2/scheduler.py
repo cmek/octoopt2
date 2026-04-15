@@ -155,7 +155,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     )
 
     try:
-        apply_decision(decision, config.givenergy, config.battery)
+        apply_decision(decision, config.givenergy, config.battery, config.db_path)
     except Exception as exc:
         logger.error("Failed to apply inverter decision: %s", exc)
 
