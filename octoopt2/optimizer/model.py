@@ -142,9 +142,15 @@ def optimize(
     is_importing = [pulp.LpVariable(f"ii_{t}", cat="Binary") for t in range(n)]
 
     # ── Objective ─────────────────────────────────────────────────────────
+    # Grid cost/revenue + a small per-kWh penalty on battery throughput.
+    # The cycle cost makes the optimizer demand a minimum economic justification
+    # before cycling the battery, filtering out thin-margin cycles driven by
+    # forecast noise. It is not a real cost — it is never paid — but it shifts
+    # the break-even spread by roughly 2× cycle_cost (≈3p with the default 1.5p).
     prob += pulp.lpSum(
         inputs.buy_prices[t] * grid_import[t]
         - inputs.sell_prices[t] * grid_export[t]
+        + battery.cycle_cost_gbp_kwh * (bat_charge[t] + bat_discharge[t])
         for t in range(n)
     )
 

@@ -16,6 +16,10 @@ class BatteryConfig:
     # GivEnergy default max charge/discharge rate (kW) — adjust to your inverter model
     max_charge_rate_kw: float = 3.6
     max_discharge_rate_kw: float = 3.6
+    # Virtual cost added to each kWh of battery throughput to avoid thin-margin cycles.
+    # Effectively sets a minimum economic spread (~2× this value) before the optimizer
+    # will bother cycling the battery. Default 1.5p/kWh.
+    cycle_cost_gbp_kwh: float = 0.015
 
     @property
     def min_soc_kwh(self) -> float:
