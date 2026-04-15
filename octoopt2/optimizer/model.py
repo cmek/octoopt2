@@ -115,15 +115,24 @@ def optimize(
         pulp.LpVariable(f"bd_{t}", lowBound=0, upBound=max_discharge_kwh)
         for t in range(n)
     ]
-    # soc[0] = initial, soc[1..n] = end-of-slot values
-    soc = [
-        pulp.LpVariable(
-            f"soc_{t}",
-            lowBound=battery.min_soc_kwh,
-            upBound=battery.max_soc_kwh,
+    # soc[0] = initial (measured reality — no floor constraint, it may already be below min)
+    # soc[1..n] = planned future states — must respect the configured floor
+    if inputs.initial_soc_kwh < battery.min_soc_kwh:
+        logger.warning(
+            "Battery SoC %.2f kWh (%.0f%%) is below configured minimum %.2f kWh (%.0f%%) — "
+            "optimizer will prioritize charging to recover",
+            inputs.initial_soc_kwh,
+            inputs.initial_soc_kwh / battery.capacity_kwh * 100,
+            battery.min_soc_kwh,
+            battery.min_soc_pct,
         )
-        for t in range(n + 1)
-    ]
+    soc = (
+        [pulp.LpVariable("soc_0", lowBound=0, upBound=battery.max_soc_kwh)]
+        + [
+            pulp.LpVariable(f"soc_{t}", lowBound=battery.min_soc_kwh, upBound=battery.max_soc_kwh)
+            for t in range(1, n + 1)
+        ]
+    )
 
     # ── Binary variables ──────────────────────────────────────────────────
     dhw_on = [pulp.LpVariable(f"dhw_{t}", cat="Binary") for t in range(n)]
