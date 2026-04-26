@@ -1,14 +1,24 @@
 """Main optimization loop. Called every 5 minutes from cron.
 
-Run order per tick:
-  1. Read inverter state (SoC, power flows)
-  2. Refresh data feeds (TTL-aware — most calls are no-ops)
-  3. Fit load model from consumption history
-  4. Build optimizer inputs for remaining slots in the pricing window
-  5. Run MILP optimizer → schedule
-  6. Persist schedule to DB
-  7. Apply current slot's decision to inverter and Ecodan
-  8. Record actuals for the slot that just completed
+Each tick runs two paths:
+
+Fast path — runs every tick (every 5 min):
+  1. Read inverter state (SoC, power flows) and store reading
+  2. Record actuals for the slot that just completed
+  3. Apply the current slot's saved inverter decision
+     (apply_decision skips the hardware write when mode/power are unchanged,
+      so this is a no-op on all but the first tick of a new slot)
+
+Slow path — runs at slot boundaries only (:00 and :30 ticks):
+  4. Refresh data feeds (TTL-aware — most calls are no-ops)
+  5. Fit load model from consumption history
+  6. Build optimizer inputs for remaining slots in the pricing window
+  7. Run MILP optimizer → schedule
+  8. Persist schedule to DB
+  9. Apply fresh slot decision to inverter and Ecodan (inverter + DHW)
+
+The slow path also runs on first startup if no schedule is saved, and whenever
+--dry-run or --output is passed.
 """
 import logging
 from datetime import date, datetime, timedelta, timezone
@@ -36,23 +46,20 @@ _FALLBACK_LOAD_KWH = 0.5
 
 
 def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, output: bool = False) -> None:
-    """Execute one optimization tick.
-
-    dry_run=True:    runs every step except writing to hardware. Prints the
-                     full planned schedule and the command that would be sent
-                     for the current slot, then exits without touching hardware.
-    manage_dhw=False: skip all DHW control; Ecodan stays in its own auto mode
-                     and DHW is excluded from the optimization.
-    """
+    """Execute one scheduler tick (see module docstring for fast/slow path details)."""
     now = datetime.now(timezone.utc)
     logger.info("── Scheduler tick %s ──", now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FAST PATH — runs every tick
+    # ════════════════════════════════════════════════════════════════════════
 
     # ── 1. Read inverter state ─────────────────────────────────────────────
     reading = _read_inverter(config, now)
     initial_soc_kwh = reading.soc_pct / 100 * config.battery.capacity_kwh if reading else None
 
     if initial_soc_kwh is None:
-        logger.error("No inverter state available — cannot optimize")
+        logger.error("No inverter state available — cannot proceed")
         return
 
     logger.info(
@@ -60,17 +67,48 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         reading.soc_pct, initial_soc_kwh, reading.solar_w, reading.load_w,
     )
 
-    # ── 2. Refresh data feeds ──────────────────────────────────────────────
+    # ── 2. Record actuals for the completed slot ───────────────────────────
+    _record_actuals(config, now)
+
+    # ── 3. Apply current saved decision to inverter ────────────────────────
+    # Skips the hardware write when mode and power are unchanged (see apply_decision).
+    # On most ticks this is a no-op; it writes only when the slot first starts.
+    saved_decision = None
+    if not dry_run:
+        saved_decision = get_current_decision(config.db_path, now=now)
+        if saved_decision is not None:
+            try:
+                apply_decision(saved_decision, config.givenergy, config.battery, config.db_path)
+            except Exception as exc:
+                logger.error("Failed to apply inverter decision: %s", exc)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SLOW PATH — slot boundaries, first startup, or forced by flags
+    # ════════════════════════════════════════════════════════════════════════
+
+    at_slot_boundary = (now.minute % 30) < 5
+    no_saved_schedule = not dry_run and saved_decision is None
+
+    if not at_slot_boundary and not no_saved_schedule and not dry_run and not output:
+        logger.debug("Mid-slot tick — skipping optimization")
+        return
+
+    if at_slot_boundary:
+        logger.info("Slot boundary — running full optimization")
+    elif no_saved_schedule:
+        logger.info("No saved schedule — running initial optimization")
+
+    # ── 4. Refresh data feeds ──────────────────────────────────────────────
     _refresh_feeds(config, now)
 
-    # ── 3. Fit load model ─────────────────────────────────────────────────
+    # ── 5. Fit load model ─────────────────────────────────────────────────
     load_model = fit_load_model(config.db_path)
     if load_model is None:
         logger.warning(
             "Load model unavailable — using fallback %.2f kWh/slot", _FALLBACK_LOAD_KWH
         )
 
-    # ── 4. Build optimizer inputs ──────────────────────────────────────────
+    # ── 6. Build optimizer inputs ──────────────────────────────────────────
     slot_starts = _remaining_slots(config.db_path, now)
     if not slot_starts:
         logger.warning("No price data for upcoming slots — skipping optimization")
@@ -110,7 +148,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         load_forecast=load_forecast,
     )
 
-    # ── 5. Optimize ────────────────────────────────────────────────────────
+    # ── 7. Optimize ────────────────────────────────────────────────────────
     try:
         result = optimize(inputs, config.battery, config.dhw, config.givenergy, manage_dhw=manage_dhw)
         logger.info(
@@ -123,7 +161,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         _apply_safe_fallback(config)
         return
 
-    # ── 6. Save schedule / write output ──────────────────────────────────
+    # ── 8. Save schedule / write output ───────────────────────────────────
     if output:
         try:
             _write_web_output(result, inputs, now, config, manage_dhw)
@@ -139,7 +177,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     except Exception as exc:
         logger.error("Failed to save schedule: %s", exc)
 
-    # ── 7. Apply current slot decision ────────────────────────────────────
+    # ── 9. Apply fresh decision (inverter + DHW) ───────────────────────────
     decision = get_current_decision(config.db_path, now=now)
     if decision is None:
         logger.warning("No decision found for current slot — applying safe fallback")
@@ -163,9 +201,6 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         set_dhw(config.melcloud, decision.dhw_on if manage_dhw else False)
     except Exception as exc:
         logger.error("Failed to apply DHW decision: %s", exc)
-
-    # ── 8. Record actuals for completed slot ───────────────────────────────
-    _record_actuals(config, now)
 
 
 # ── Dry-run output ────────────────────────────────────────────────────────
