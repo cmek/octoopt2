@@ -4,9 +4,13 @@ Uses the vendored givenergy_modbus_async client (from GivTCP) which supports
 firmware 912+ / battery firmware 3015+. Async calls are wrapped synchronously.
 
 Three operating states per slot:
-  CHARGE    — force grid charging at desired rate
-  DISCHARGE — discharge to meet demand, or at max power when exporting
-  ECO       — dynamic mode: solar self-consumption, no forced activity
+  CHARGE           — force grid charging at desired rate
+  DISCHARGE_EXPORT — force discharge at max power, exporting surplus to grid
+  ECO              — dynamic self-consumption: battery discharges only to meet
+                     load and charges from excess solar; no forced activity.
+                     Also used for discharge-to-meet-load decisions, so the
+                     battery never force-exports when real load is below the
+                     planned discharge (see apply_decision).
 
 Register-write optimisations
 ─────────────────────────────
@@ -44,7 +48,7 @@ _RETRY_DELAY_S = 2
 
 @dataclass
 class _LastCommand:
-    mode: str           # CHARGE | DISCHARGE_DEMAND | DISCHARGE_EXPORT | ECO
+    mode: str           # CHARGE | DISCHARGE_EXPORT | ECO
     power_register: int # 1-50 for CHARGE/DISCHARGE; 0 for ECO
 
 
@@ -99,15 +103,22 @@ def apply_decision(
     wants_discharge = decision.battery_discharge_kwh > _THRESHOLD_KWH
     wants_export    = decision.grid_export_kwh       > _THRESHOLD_KWH
 
+    # Only force-discharge when the plan is to EXPORT. A discharge-to-meet-load
+    # decision is run as dynamic self-consumption (ECO) instead: forcing the
+    # discharge slot would drain the battery to the grid whenever real load is
+    # below the planned discharge (high PV, or DHW the inverter cannot serve),
+    # violating the export=0 intent. Dynamic mode discharges only to meet load.
+    force_export = wants_discharge and wants_export
+
     # Determine desired hardware state
     if wants_charge:
         charge_kw  = decision.battery_charge_kwh / 0.5
         power_reg  = _kw_to_register(charge_kw, battery.max_charge_rate_kw)
         mode       = "CHARGE"
-    elif wants_discharge:
+    elif force_export:
         discharge_kw = decision.battery_discharge_kwh / 0.5
         power_reg    = _kw_to_register(discharge_kw, battery.max_discharge_rate_kw)
-        mode         = "DISCHARGE_EXPORT" if wants_export else "DISCHARGE_DEMAND"
+        mode         = "DISCHARGE_EXPORT"
     else:
         power_reg = 0
         mode      = "ECO"
@@ -125,8 +136,8 @@ def apply_decision(
     # ── Build command list ────────────────────────────────────────────────
     if wants_charge:
         reqs = _cmds_charge(charge_kw, power_reg, last_mode)
-    elif wants_discharge:
-        reqs = _cmds_discharge(discharge_kw, power_reg, wants_export, last_mode)
+    elif force_export:
+        reqs = _cmds_discharge(discharge_kw, power_reg, last_mode)
     else:
         reqs = _cmds_eco()
 
@@ -156,22 +167,18 @@ def _cmds_charge(charge_kw: float, limit: int, last_mode: str | None) -> list:
     return cmds
 
 
-def _cmds_discharge(discharge_kw: float, limit: int, export: bool, last_mode: str | None) -> list:
-    """Build discharge commands. Slot-time register only written when entering DISCHARGE."""
-    mode_label = "EXPORT" if export else "DEMAND"
-    logger.info("Inverter → DISCHARGE/%s %.2f kW (register %d)", mode_label, discharge_kw, limit)
+def _cmds_discharge(discharge_kw: float, limit: int, last_mode: str | None) -> list:
+    """Build forced-discharge commands for an EXPORT decision: discharge at max
+    power up to the rate limit, exporting any surplus to the grid. The slot-time
+    register is only written when entering DISCHARGE_EXPORT."""
+    logger.info("Inverter → DISCHARGE/EXPORT %.2f kW (register %d)", discharge_kw, limit)
     reqs = []
-    if last_mode not in ("DISCHARGE_DEMAND", "DISCHARGE_EXPORT"):
-        # Entering DISCHARGE from a non-discharge mode — set slot window.
+    if last_mode != "DISCHARGE_EXPORT":
+        # Entering forced discharge from another mode — set slot window.
         reqs += [*commands.set_discharge_slot_1(TimeSlot(start=dt_time(0, 0), end=dt_time(23, 59)))]
     reqs += [
         *commands.set_battery_discharge_limit(limit),
-    ]
-    if export:
-        reqs += [*commands.set_discharge_mode_max_power()]
-    else:
-        reqs += [*commands.set_discharge_mode_to_match_demand()]
-    reqs += [
+        *commands.set_discharge_mode_max_power(),
         *commands.enable_discharge(),
         *commands.disable_charge(),
     ]

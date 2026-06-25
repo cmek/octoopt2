@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS actuals (
 CREATE TABLE IF NOT EXISTS inverter_last_command (
     id             INTEGER PRIMARY KEY CHECK (id = 1),
     applied_at     TEXT NOT NULL,
-    mode           TEXT NOT NULL,       -- CHARGE | DISCHARGE_DEMAND | DISCHARGE_EXPORT | ECO
+    mode           TEXT NOT NULL,       -- CHARGE | DISCHARGE_EXPORT | ECO
     power_register INTEGER NOT NULL,    -- charge/discharge limit register (1-50); 0 for ECO
     total_writes   INTEGER NOT NULL DEFAULT 0  -- cumulative lifetime register writes sent
 );
