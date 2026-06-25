@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from ..config import GivEnergyConfig
 from ..db import get_conn
 from ..givenergy_modbus_async.client.client import Client
-from ..givenergy_modbus_async.client import commands
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +43,9 @@ async def _read_async(config: GivEnergyConfig) -> InverterReading:
         inv = client.plant.inverter
 
         p_grid = float(inv.p_grid_out)
+        # p_battery (IR 52) is positive when DISCHARGING on this inverter —
+        # the opposite convention to p_grid_out. Confirmed by energy balance:
+        # solar + battery_discharge + import == load + export (+ losses).
         p_batt = float(inv.p_battery)
 
         return InverterReading(
@@ -52,8 +54,8 @@ async def _read_async(config: GivEnergyConfig) -> InverterReading:
             solar_w=float(inv.p_pv1) + float(inv.p_pv2),
             grid_import_w=max(0.0, -p_grid),
             grid_export_w=max(0.0, p_grid),
-            battery_charge_w=max(0.0, p_batt),
-            battery_discharge_w=max(0.0, -p_batt),
+            battery_charge_w=max(0.0, -p_batt),
+            battery_discharge_w=max(0.0, p_batt),
             load_w=float(inv.p_load_demand),
         )
     finally:
