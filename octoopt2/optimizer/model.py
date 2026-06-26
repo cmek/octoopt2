@@ -196,7 +196,14 @@ def optimize(
     # ── DHW daily minimums and maximums ───────────────────────────────────
     if manage_dhw:
         for day_slots in _group_slots_by_day(inputs.slot_starts):
-            prob += pulp.lpSum(dhw_on[t] for t in day_slots) >= dhw.min_slots_per_day
+            # The horizon starts mid-day and ends mid-day, so the first and last
+            # UK days are partial. A partial day holding fewer than
+            # min_slots_per_day slots cannot satisfy the daily minimum — forcing
+            # it would make the whole problem infeasible — so only require the
+            # minimum on days the horizon covers enough of. The cap still applies
+            # to every (partial) day to avoid over-heating at the edges.
+            if len(day_slots) >= dhw.min_slots_per_day:
+                prob += pulp.lpSum(dhw_on[t] for t in day_slots) >= dhw.min_slots_per_day
             prob += pulp.lpSum(dhw_on[t] for t in day_slots) <= dhw.max_slots_per_day
     else:
         for t in range(n):
@@ -207,10 +214,18 @@ def optimize(
     prob.solve(solver)
 
     status = pulp.LpStatus[prob.status]
-    if prob.status not in (pulp.constants.LpStatusOptimal, pulp.constants.LpStatusNotSolved):
-        # LpStatusNotSolved can still yield a feasible solution within timeLimit
-        if pulp.value(prob.objective) is None:
-            raise RuntimeError(f"Optimizer returned no solution: {status}")
+    # Accept a proven optimum, or a feasible incumbent found before the time
+    # limit was hit (NotSolved). Anything else — notably Infeasible/Unbounded —
+    # must NOT be turned into a schedule: pulp.value() still returns numbers
+    # from stale/zero variables for an infeasible solve, so without this guard
+    # the caller would silently apply a garbage plan. Raising lets the scheduler
+    # fall back to a safe state instead.
+    usable = prob.status == pulp.constants.LpStatusOptimal or (
+        prob.status == pulp.constants.LpStatusNotSolved
+        and pulp.value(prob.objective) is not None
+    )
+    if not usable:
+        raise RuntimeError(f"Optimizer found no usable solution: {status}")
 
     logger.info(
         "Optimizer: status=%s cost=£%.4f slots=%d",
@@ -258,9 +273,9 @@ def _val(var: pulp.LpVariable) -> float:
 def _group_slots_by_day(slot_starts: list[datetime]) -> list[list[int]]:
     """Group slot indices by UK calendar day.
 
-    Returns a list of lists of indices. Only days with at least min_slots_per_day
-    slots in the horizon are included (partial days at the edges get their own
-    group and the constraint applies to however many slots are present).
+    Returns a list of lists of indices — one list per UK calendar day present in
+    the horizon, including partial days at the edges. The caller decides how to
+    treat under-covered partial days (see the DHW constraints in optimize()).
     """
     from collections import defaultdict
     day_map: dict = defaultdict(list)
