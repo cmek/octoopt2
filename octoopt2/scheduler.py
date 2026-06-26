@@ -25,7 +25,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from .config import AppConfig
-from .control.ecodan import set_dhw
+from .control.ecodan import read_and_store_dhw_state, set_dhw
 from .control.inverter import apply_decision
 from .data.consumption import fetch_and_store_consumption
 from .data.inverter import get_latest_reading, read_and_store
@@ -101,6 +101,11 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     # ── 4. Refresh data feeds ──────────────────────────────────────────────
     _refresh_feeds(config, now)
 
+    # ── 4b. Log ground-truth DHW tank state (best-effort) ──────────────────
+    # One MELCloud read per slot boundary; failures are logged, not fatal.
+    if not dry_run:
+        read_and_store_dhw_state(config.melcloud, config.db_path)
+
     # ── 5. Fit load model ─────────────────────────────────────────────────
     load_model = fit_load_model(config.db_path)
     if load_model is None:
@@ -150,7 +155,11 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
 
     # ── 7. Optimize ────────────────────────────────────────────────────────
     try:
-        result = optimize(inputs, config.battery, config.dhw, config.givenergy, manage_dhw=manage_dhw)
+        result = optimize(
+            inputs, config.battery, config.dhw, config.givenergy,
+            manage_dhw=manage_dhw,
+            dhw_kwh_per_slot=load_model.dhw_kwh_per_slot if load_model else None,
+        )
         logger.info(
             "Optimization complete: status=%s total_cost=£%.4f",
             result.solver_status,

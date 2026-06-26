@@ -44,7 +44,8 @@ class OptimizerInput:
     buy_prices: list[float]       # £/kWh per slot
     sell_prices: list[float]      # £/kWh per slot
     solar_forecast: list[float]   # kWh per slot
-    load_forecast: list[float]    # kWh per slot (predicted home consumption)
+    load_forecast: list[float]    # kWh per slot (predicted NON-DHW gross load;
+                                  # DHW added separately via dhw_kwh_per_slot)
 
     def __post_init__(self) -> None:
         n = len(self.slot_starts)
@@ -80,17 +81,26 @@ def optimize(
     dhw: DhwConfig,
     givenergy: GivEnergyConfig,
     manage_dhw: bool = True,
+    dhw_kwh_per_slot: float | None = None,
 ) -> OptimizerResult:
     """Run the MILP optimizer and return a schedule.
 
     If the solver cannot find an optimal solution it falls back to a feasible
     solution, or raises RuntimeError if the problem is infeasible.
+
+    dhw_kwh_per_slot: energy added to the load balance for each slot DHW is
+        enabled. Pass the load model's fitted β (the empirically-observed
+        average draw per enabled slot) here; it is materially lower than the
+        nameplate `dhw.power_kw * SLOT_HOURS` because the tank is often already
+        at target when DHW is commanded. Falls back to the nameplate value when
+        None (e.g. before a model has been fitted).
     """
     n = len(inputs.slot_starts)
     if n == 0:
         raise ValueError("No slots to optimize")
 
-    dhw_kwh_per_slot = dhw.power_kw * SLOT_HOURS
+    if dhw_kwh_per_slot is None:
+        dhw_kwh_per_slot = dhw.power_kw * SLOT_HOURS
     max_charge_kwh = battery.max_charge_rate_kw * SLOT_HOURS
     max_discharge_kwh = battery.max_discharge_rate_kw * SLOT_HOURS
     max_import_kwh = givenergy.max_import_kw * SLOT_HOURS

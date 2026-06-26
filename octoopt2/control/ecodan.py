@@ -10,12 +10,14 @@ DHW is controlled by switching the heat pump's operation mode:
 """
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 import aiohttp
 import pymelcloud
 from pymelcloud import DEVICE_TYPE_ATW
 
 from ..config import MelCloudConfig
+from ..db import get_conn
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,36 @@ def get_dhw_state(config: MelCloudConfig) -> dict:
     target_tank_temperature, status.
     """
     return asyncio.run(_get_dhw_state_async(config))
+
+
+def read_and_store_dhw_state(config: MelCloudConfig, db_path: str) -> dict | None:
+    """Read DHW state from MELCloud and persist it to dhw_readings. Best-effort.
+
+    Returns the state dict, or None if the read failed (logged, never raised) —
+    so a MELCloud hiccup can't break a scheduler tick.
+    """
+    try:
+        state = get_dhw_state(config)
+    except Exception as exc:
+        logger.warning("Failed to read DHW state for logging: %s", exc)
+        return None
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO dhw_readings
+                (recorded_at, operation_mode, tank_temperature_c,
+                 target_tank_temperature_c, status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                state.get("operation_mode"),
+                state.get("tank_temperature"),
+                state.get("target_tank_temperature"),
+                state.get("status"),
+            ),
+        )
+    return state
 
 
 # ── Async internals ────────────────────────────────────────────────────────

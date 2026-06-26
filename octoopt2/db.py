@@ -87,6 +87,17 @@ CREATE TABLE IF NOT EXISTS actuals (
     cost_gbp         REAL   -- negative = earned money
 );
 
+-- Ground-truth DHW (Ecodan) tank state, sampled each slot boundary from
+-- MELCloud. Lets a future load-model refit replace the planned dhw_on regressor
+-- with confirmed heating activity (tank below target / status heating).
+CREATE TABLE IF NOT EXISTS dhw_readings (
+    recorded_at               TEXT NOT NULL PRIMARY KEY,
+    operation_mode            TEXT,   -- force_hot_water | auto | ...
+    tank_temperature_c        REAL,
+    target_tank_temperature_c REAL,
+    status                    TEXT
+);
+
 -- Last inverter command successfully applied (singleton row, id always = 1).
 -- Used to skip redundant register writes and to omit slot-time commands when
 -- the mode has not changed.

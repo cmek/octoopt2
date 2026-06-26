@@ -1,19 +1,36 @@
 """Load forecasting model.
 
-Fits a temperature-adjusted baseline from historical Octopus consumption data:
+Fits a temperature-adjusted, DHW-adjusted baseline from historical *gross*
+household load:
 
     predicted_load[t] = baseline[day_type][slot_index] + α * (temp[t] - ref_temp)
+
+The baseline represents NON-DHW gross load. The fit is a single least-squares
+regression of measured gross load on:
+  - one intercept per (day_type, slot_index) group  → baseline[day_type][slot]
+  - α: temperature coefficient (kWh per °C)
+  - β: DHW coefficient (kWh per slot the optimizer enabled DHW) → dhw_kwh_per_slot
 
 Where:
   - slot_index: 0–47, half-hour slot number within the day in UK local time
   - day_type: 'weekday', 'weekend', or 'holiday'
-  - α: single temperature coefficient fitted by OLS across all historical slots
   - ref_temp: mean historical temperature (so baseline represents typical conditions)
 
-The model is cheap to fit (~milliseconds on 30 days of data) so it is re-fitted
-on every optimizer run, always incorporating the latest consumption data.
+Gross load is taken from inverter_readings.load_w (p_load_demand) — the real
+household consumption measured behind the grid CT, which includes the Ecodan
+DHW load. We deliberately do NOT use the Octopus consumption (net grid import):
+it nets out solar and battery, so it is a poor — nearly inverted — proxy for
+gross load (inflated at night by battery grid-charging, ~0 midday under solar).
+
+The β·dhw_on regressor pulls the DHW load out of the baseline, so the baseline
+is the non-DHW load the optimizer needs, and β is the empirical average DHW
+energy actually drawn per enabled slot (typically << the nameplate 1.5 kW
+because the tank is often already at target when DHW is commanded).
+
+The model is cheap to fit (~tens of ms) so it is re-fitted on every optimizer run.
 """
 import logging
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -22,6 +39,9 @@ import holidays
 import numpy as np
 
 from ..db import get_conn
+
+# Each 30-min slot is 0.5 h, so kWh = mean_power_W / 1000 * 0.5.
+_SLOT_HOURS = 0.5
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +69,10 @@ class LoadModel:
     ref_temp: float
     # How many historical slots were used to fit the model
     n_slots: int
+    # Empirical average DHW energy drawn per enabled slot (kWh). This is the
+    # fitted β; the optimizer should use it as dhw_kwh_per_slot instead of the
+    # nameplate config value (see optimizer.model.optimize).
+    dhw_kwh_per_slot: float = 0.0
     fitted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def predict(
@@ -77,96 +101,94 @@ class LoadModel:
 
 
 def fit_load_model(db_path: str) -> LoadModel | None:
-    """Fit the load model from historical consumption and weather data.
+    """Fit the load model from historical gross load, weather, and DHW schedule.
 
-    Returns None if there is insufficient data (less than MIN_SLOTS).
+    Jointly fits, by least squares:
+      gross_load[t] = baseline[day_type, slot_index]
+                      + α·(temp[t] - ref_temp)
+                      + β·dhw_on[t]
+    so `baseline` is the non-DHW load and β is the empirical DHW draw per
+    enabled slot. Returns None if there is insufficient data (< MIN_SLOTS).
     """
-    consumption = _load_consumption(db_path)
-    if len(consumption) < MIN_SLOTS:
+    gross = _load_gross_load(db_path)
+    if len(gross) < MIN_SLOTS:
         logger.warning(
-            "Only %d consumption slots available (need %d) — load model not fitted",
-            len(consumption),
+            "Only %d gross-load slots available (need %d) — load model not fitted",
+            len(gross),
             MIN_SLOTS,
         )
         return None
 
     weather = _load_weather(db_path)
+    dhw_sched = _load_dhw_schedule(db_path)
     logger.info(
-        "Fitting load model from %d consumption slots, %d weather slots",
-        len(consumption),
+        "Fitting load model from %d gross-load slots, %d weather slots",
+        len(gross),
         len(weather),
     )
 
-    # Build arrays for regression
-    slot_starts = []
-    consumptions = []
-    temperatures = []
+    slot_starts = list(gross.keys())
+    loads = np.array([gross[s] for s in slot_starts])
+    temps = [_nearest_temperature(s, weather) for s in slot_starts]
+    dhw_on = np.array([float(dhw_sched.get(s, 0)) for s in slot_starts])
 
-    for slot_start, kwh in consumption.items():
-        temp = _nearest_temperature(slot_start, weather)
-        if temp is None:
-            continue
-        slot_starts.append(slot_start)
-        consumptions.append(kwh)
-        temperatures.append(temp)
-
-    if len(slot_starts) < MIN_SLOTS:
+    # Use temperature only if enough slots have a matching reading; otherwise
+    # fall back to a baseline+DHW model with α=0.
+    have_temp = np.array([t is not None for t in temps])
+    use_temp = int(have_temp.sum()) >= MIN_SLOTS
+    fit_mask = have_temp if use_temp else np.ones(len(slot_starts), dtype=bool)
+    if not use_temp:
         logger.warning(
-            "Only %d slots have matching temperature data — fitting baseline-only model (α=0)",
-            len(slot_starts),
+            "Only %d slots have matching temperature data — fitting baseline+DHW model (α=0)",
+            int(have_temp.sum()),
         )
-        # Fall back to fitting the per-(day_type, slot_index) baseline from all
-        # consumption data, without a temperature coefficient.
-        slot_starts = list(consumption.keys())
-        consumptions = np.array(list(consumption.values()))
-        temperatures = np.zeros(len(consumptions))  # unused when alpha=0
 
-    consumptions = np.array(consumptions)
-    temperatures = np.array(temperatures)
-    ref_temp = float(np.mean(temperatures))
+    fit_idx = np.flatnonzero(fit_mask)
+    temp_vals = np.array([temps[i] if temps[i] is not None else 0.0 for i in fit_idx])
+    ref_temp = float(temp_vals.mean()) if use_temp else 0.0
 
-    # Compute per-(day_type, slot_index) baselines using the mean at ref_temp.
-    # We fit α using OLS on the residuals after removing group means.
+    # One design column per (day_type, slot_index) group present in the data,
+    # plus (optionally) a temperature column and a DHW column.
+    group_of = [(_day_type(slot_starts[i]), _slot_index(slot_starts[i])) for i in fit_idx]
+    groups = {g: j for j, g in enumerate(sorted(set(group_of)))}
+    p = len(groups)
+    n_extra = (1 if use_temp else 0) + 1  # temp? + dhw
+    X = np.zeros((len(fit_idx), p + n_extra))
+    for row, (i, g) in enumerate(zip(fit_idx, group_of)):
+        X[row, groups[g]] = 1.0
+        col = p
+        if use_temp:
+            X[row, col] = temp_vals[row] - ref_temp
+            col += 1
+        X[row, col] = dhw_on[i]
+
+    coef, *_ = np.linalg.lstsq(X, loads[fit_idx], rcond=None)
+    alpha = float(coef[p]) if use_temp else 0.0
+    beta = float(coef[p + (1 if use_temp else 0)])
+    # β is an energy and feeds the optimizer — clamp away negative noise.
+    beta = max(0.0, beta)
+
     baseline: dict[str, np.ndarray] = {
         "weekday": np.zeros(48),
         "weekend": np.zeros(48),
         "holiday": np.zeros(48),
     }
-    counts: dict[str, np.ndarray] = {k: np.zeros(48) for k in baseline}
-
-    for i, slot_start in enumerate(slot_starts):
-        day_type = _day_type(slot_start)
-        slot_idx = _slot_index(slot_start)
-        baseline[day_type][slot_idx] += consumptions[i]
-        counts[day_type][slot_idx] += 1
-
-    # Convert sums to means; leave zero for slots with no data
-    for day_type in baseline:
-        mask = counts[day_type] > 0
-        baseline[day_type][mask] /= counts[day_type][mask]
-
-    # Compute group-mean residuals and fit α via OLS
-    residuals = np.zeros(len(slot_starts))
-    for i, slot_start in enumerate(slot_starts):
-        day_type = _day_type(slot_start)
-        slot_idx = _slot_index(slot_start)
-        residuals[i] = consumptions[i] - baseline[day_type][slot_idx]
-
-    temp_deviations = temperatures - ref_temp
-    denom = np.sum(temp_deviations ** 2)
-    alpha = float(np.sum(residuals * temp_deviations) / denom) if denom > 0 else 0.0
+    for (day_type, slot_idx), j in groups.items():
+        baseline[day_type][slot_idx] = coef[j]
 
     logger.info(
-        "Load model fitted: α=%.4f kWh/°C, ref_temp=%.1f°C, n=%d slots",
+        "Load model fitted: α=%.4f kWh/°C, β(DHW)=%.3f kWh/slot, ref_temp=%.1f°C, n=%d slots",
         alpha,
+        beta,
         ref_temp,
-        len(slot_starts),
+        len(fit_idx),
     )
     return LoadModel(
         baseline=baseline,
         alpha=alpha,
         ref_temp=ref_temp,
-        n_slots=len(slot_starts),
+        n_slots=int(len(fit_idx)),
+        dhw_kwh_per_slot=beta,
     )
 
 
@@ -246,14 +268,42 @@ def _nearest_temperature(
     return None
 
 
-def _load_consumption(db_path: str) -> dict[datetime, float]:
-    """Load all consumption records from DB as slot_start → kWh."""
+def _load_gross_load(db_path: str) -> dict[datetime, float]:
+    """Aggregate inverter_readings.load_w into gross load (kWh) per 30-min slot.
+
+    load_w is p_load_demand — gross household consumption behind the grid CT,
+    including the Ecodan DHW load. Readings arrive every ~5 min (irregular), so
+    each slot's mean power is converted to energy: mean_W / 1000 * 0.5 h.
+    """
+    buckets: dict[datetime, list[float]] = defaultdict(list)
     with get_conn(db_path) as conn:
         rows = conn.execute(
-            "SELECT slot_start, consumption_kwh FROM consumption ORDER BY slot_start"
+            "SELECT recorded_at, load_w FROM inverter_readings"
+        ).fetchall()
+    for r in rows:
+        dt = datetime.fromisoformat(r["recorded_at"]).astimezone(timezone.utc)
+        slot = dt.replace(minute=(dt.minute // 30) * 30, second=0, microsecond=0)
+        buckets[slot].append(r["load_w"])
+    return {
+        slot: float(np.mean(ws)) / 1000.0 * _SLOT_HOURS
+        for slot, ws in buckets.items()
+        if ws
+    }
+
+
+def _load_dhw_schedule(db_path: str) -> dict[datetime, int]:
+    """Load historical DHW enable flags as slot_start → 0/1 from the schedule.
+
+    This is the *planned* dhw_on (what the optimizer enabled), used as the DHW
+    regressor. It is not confirmed actuation — see dhw_readings for ground-truth
+    tank state logged each slot, which a future refit can switch to.
+    """
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT slot_start, dhw_on FROM schedule"
         ).fetchall()
     return {
-        datetime.fromisoformat(r["slot_start"]): r["consumption_kwh"]
+        datetime.fromisoformat(r["slot_start"]).astimezone(timezone.utc): int(r["dhw_on"])
         for r in rows
     }
 
