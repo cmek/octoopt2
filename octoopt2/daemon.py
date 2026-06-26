@@ -24,19 +24,26 @@ Run with:  uv run octoopt2-daemon
 """
 import argparse
 import asyncio
+import json
 import logging
+import mimetypes
 import signal
 import sys
+import threading
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
-from prometheus_client import REGISTRY, start_http_server
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 
 from .config import AppConfig
 from .control.ecodan import _get_dhw_state_async
 from .data.inverter import InverterReading, read_inverter
 from .db import init_db
 from .metrics import OctooptCollector
+from .status import build_status
 from . import scheduler
 
 logging.basicConfig(
@@ -65,6 +72,82 @@ class DaemonState:
     latest_reading: InverterReading | None = None
     latest_dhw: dict | None = None
     latest_dhw_at: datetime | None = None
+    # Rolling history of recent inverter readings for the dashboard's sparklines.
+    # 240 samples × 30 s ≈ 2 h. deque.append/iterate are atomic under the GIL, so
+    # the metrics HTTP thread can read it without locking.
+    history: deque = field(default_factory=lambda: deque(maxlen=240))
+
+
+# ── HTTP server (metrics + live dashboard) ──────────────────────────────────
+
+# Directory holding the dashboard's static assets (status.html etc.), resolved
+# relative to the working directory like the optimizer's web/schedule.json output.
+_WEB_DIR = Path("web")
+
+
+def _make_handler(state: "DaemonState", config: AppConfig):
+    """Build a request handler serving /metrics, /status.json, and web/ statics."""
+    web_root = _WEB_DIR.resolve()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args) -> None:  # silence per-request logging
+            pass
+
+        def _send(self, code: int, content_type: str, body: bytes, cache: bool = True) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            if not cache:
+                self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _serve_static(self, rel: str) -> None:
+            try:
+                target = (web_root / rel).resolve()
+                target.relative_to(web_root)  # reject path traversal
+                body = target.read_bytes()
+            except (FileNotFoundError, IsADirectoryError, ValueError):
+                self._send(404, "text/plain", b"Not found", cache=False)
+                return
+            ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+            self._send(200, ctype, body)
+
+        def do_GET(self) -> None:
+            path = self.path.split("?", 1)[0]
+            if path == "/metrics":
+                self._send(200, CONTENT_TYPE_LATEST, generate_latest(REGISTRY), cache=False)
+                return
+            if path == "/status.json":
+                try:
+                    payload = build_status(
+                        state, config.db_path, config.battery.capacity_kwh
+                    )
+                    body = json.dumps(payload).encode()
+                    self._send(200, "application/json", body, cache=False)
+                except Exception as exc:
+                    logger.warning("status.json build failed: %s", exc)
+                    self._send(
+                        500, "application/json",
+                        json.dumps({"error": str(exc)}).encode(), cache=False,
+                    )
+                return
+            rel = path.lstrip("/") or "status.html"
+            self._serve_static(rel)
+
+        do_HEAD = do_GET
+
+    return Handler
+
+
+def _start_http_server(state: "DaemonState", config: AppConfig) -> None:
+    """Start the combined metrics + dashboard HTTP server in a background thread."""
+    handler = _make_handler(state, config)
+    httpd = ThreadingHTTPServer(("", config.daemon.metrics_port), handler)
+    thread = threading.Thread(target=httpd.serve_forever, name="http", daemon=True)
+    thread.start()
 
 
 def _seconds_until_next(period_seconds: int) -> float:
@@ -84,6 +167,7 @@ async def _poll_inverter_loop(config: AppConfig, state: DaemonState) -> None:
             async with state.inverter_lock:
                 reading = await asyncio.to_thread(read_inverter, config.givenergy)
             state.latest_reading = reading
+            state.history.append(reading)
             logger.debug(
                 "Poll: SoC=%.1f%% solar=%.0fW load=%.0fW",
                 reading.soc_pct, reading.solar_w, reading.load_w,
@@ -154,9 +238,10 @@ async def _run(
     state = DaemonState()
 
     REGISTRY.register(OctooptCollector(state, config.db_path))
-    start_http_server(config.daemon.metrics_port)
+    _start_http_server(state, config)
     logger.info(
-        "Metrics server listening on :%d/metrics", config.daemon.metrics_port
+        "HTTP server listening on :%d — /metrics, /status.json, dashboard at /",
+        config.daemon.metrics_port,
     )
 
     stop = asyncio.Event()

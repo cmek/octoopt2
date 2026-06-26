@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>octoopt2 — Live</title>
+<style>
+:root {
+  --bg:       #0f172a;
+  --surface:  #1e293b;
+  --surface2: #293548;
+  --border:   #334155;
+  --text:     #f1f5f9;
+  --muted:    #94a3b8;
+  --green:    #22c55e;
+  --red:      #ef4444;
+  --blue:     #60a5fa;
+  --orange:   #fb923c;
+  --amber:    #fbbf24;
+  --purple:   #a78bfa;
+  --teal:     #2dd4bf;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 13px; min-height: 100vh; }
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.page { max-width: 1100px; margin: 0 auto; padding: 16px; }
+
+header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 0 16px; border-bottom: 1px solid var(--border); margin-bottom: 16px; flex-wrap: wrap;
+}
+header h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
+header nav { font-size: 12px; color: var(--muted); display: flex; gap: 10px; }
+.badge { padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; display: inline-flex; align-items: center; gap: 6px; }
+.badge::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.badge-online   { background: #14532d; color: var(--green); }
+.badge-offline  { background: #7f1d1d; color: var(--red); }
+.badge-loading  { background: #1e3a5f; color: var(--blue); }
+.header-right { margin-left: auto; display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; }
+
+/* ── Energy flow ── */
+.flow-wrap {
+  background: radial-gradient(ellipse at center, #16233c 0%, var(--surface) 70%);
+  border: 1px solid var(--border); border-radius: 10px; padding: 8px; margin-bottom: 16px;
+}
+.flow-svg { width: 100%; height: auto; display: block; max-height: 460px; }
+.node-circle { transition: stroke 0.4s; }
+.node-val { font-size: 19px; font-weight: 700; fill: var(--text); }
+.node-sub { font-size: 11px; fill: var(--muted); }
+.spoke-base { fill: none; stroke: var(--border); stroke-width: 2; }
+.flow { fill: none; stroke-width: 3.5; stroke-linecap: round; stroke-dasharray: 1.5 13; }
+@keyframes flowin  { to { stroke-dashoffset: -300; } }
+@keyframes flowout { to { stroke-dashoffset:  300; } }
+.flow-in  { animation: flowin  var(--spd,1.4s) linear infinite; }
+.flow-out { animation: flowout var(--spd,1.4s) linear infinite; }
+
+/* ── Cards ── */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+.card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.card-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600; }
+.card-value { font-size: 24px; font-weight: 700; line-height: 1.1; }
+.card-row { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; border-top: 1px solid #1e293b; }
+.card-row:first-of-type { border-top: none; }
+.card-row .k { color: var(--muted); }
+.card-row .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+.pill { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+.pill-on  { background: #14532d; color: var(--green); }
+.pill-off { background: var(--surface2); color: var(--muted); }
+.pill-charge { background: #1e3a5f; color: var(--blue); }
+.pill-dis  { background: #431407; color: var(--orange); }
+.pill-eco  { background: var(--surface2); color: var(--muted); }
+.cost-pos { color: var(--red); }
+.cost-neg { color: var(--green); }
+.cost-zero { color: var(--muted); }
+
+/* ── Mini battery icon in card ── */
+.soc-track { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-top: 8px; }
+.soc-fill { height: 100%; border-radius: 4px; transition: width 0.5s, background 0.5s; }
+
+/* ── Feeds ── */
+.feeds { display: flex; gap: 8px; flex-wrap: wrap; }
+.feed { display: flex; align-items: center; gap: 6px; background: var(--surface2); border-radius: 6px; padding: 4px 10px; font-size: 12px; }
+.feed .dot { width: 8px; height: 8px; border-radius: 50%; }
+.feed .name { color: var(--muted); text-transform: capitalize; }
+.feed .age { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* ── Sparklines ── */
+.sparks { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.spark { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.spark-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+.spark-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+.spark-now { font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.spark svg { width: 100%; height: 48px; display: block; }
+
+/* ── Upcoming price strip ── */
+.strip-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; }
+.strip-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; margin-bottom: 10px; }
+.strip { display: flex; gap: 3px; overflow-x: auto; align-items: flex-end; }
+.bar { flex: 1 0 26px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.bar .col { width: 100%; border-radius: 3px 3px 0 0; min-height: 3px; }
+.bar .t { font-size: 9px; color: var(--muted); white-space: nowrap; }
+.bar .p { font-size: 10px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.bar.cur { outline: 1px solid var(--blue); outline-offset: 2px; border-radius: 4px; }
+.bar .dhw { width: 6px; height: 6px; border-radius: 50%; background: var(--teal); }
+.bar .dhw.off { background: transparent; }
+
+section { margin-bottom: 16px; }
+
+footer { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.state-msg { text-align: center; padding: 60px 20px; color: var(--muted); }
+.state-msg h2 { font-size: 18px; margin-bottom: 8px; }
+.state-msg code { background: var(--surface2); padding: 2px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>octoopt2</h1>
+    <span id="status-badge" class="badge badge-loading">loading</span>
+    <div class="header-right">
+      <nav><a href="index.html">Schedule</a><a href="accuracy.html">Accuracy</a></nav>
+      <span id="updated"></span>
+      <button class="refresh-btn" onclick="loadData()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">↻</button>
+    </div>
+  </header>
+
+  <div id="app"><div class="state-msg"><h2>Loading…</h2></div></div>
+
+  <footer>
+    <span>octoopt2 live dashboard</span>
+    <span id="foot-note">Auto-refreshing</span>
+  </footer>
+</div>
+
+<script>
+// ── Formatting helpers ───────────────────────────────────────────────────────
+const kW = w => (w == null) ? '—' : (Math.abs(w) < 50 ? '0.0' : (w / 1000).toFixed(2)) + ' kW';
+const num = (v, d=2) => v == null ? '—' : v.toFixed(d);
+
+function fmtAge(s) {
+  if (s == null) return '—';
+  const neg = s < 0; s = Math.abs(s);
+  let out;
+  if (s < 90) out = Math.round(s) + 's';
+  else if (s < 5400) out = Math.round(s / 60) + 'm';
+  else if (s < 172800) out = (s / 3600).toFixed(s < 36000 ? 1 : 0) + 'h';
+  else out = Math.round(s / 86400) + 'd';
+  return (neg ? 'in ' : '') + out + (neg ? '' : ' ago');
+}
+
+function gbp(v) {
+  if (v == null) return '—';
+  const sign = v < -0.0005 ? '−' : v > 0.0005 ? '+' : '';
+  return sign + '£' + Math.abs(v).toFixed(2);
+}
+function costClass(v) {
+  if (v == null || Math.abs(v) < 0.0005) return 'cost-zero';
+  return v > 0 ? 'cost-pos' : 'cost-neg';
+}
+function socColor(p) {
+  if (p == null) return 'var(--muted)';
+  if (p <= 20) return '#ef4444';
+  if (p <= 40) return '#f97316';
+  if (p <= 70) return '#22c55e';
+  return '#60a5fa';
+}
+function priceColor(p) {
+  if (p == null) return '#475569';
+  if (p < 0)  return '#a78bfa';
+  if (p < 5)  return '#22c55e';
+  if (p < 15) return '#84cc16';
+  if (p < 25) return '#fbbf24';
+  if (p < 35) return '#fb923c';
+  return '#ef4444';
+}
+
+// ── Energy-flow diagram ──────────────────────────────────────────────────────
+// Four nodes (Solar top, Home centre, Battery, Grid) with animated spokes whose
+// direction follows the real power flow — toward Home = consuming, away = sourcing.
+
+const NODES = {
+  home:  { x: 210, y: 165, r: 50, color: 'var(--teal)' },
+  solar: { x: 210, y: 52,  r: 42, color: 'var(--amber)' },
+  batt:  { x: 78,  y: 300, r: 42, color: 'var(--blue)' },
+  grid:  { x: 342, y: 300, r: 42, color: 'var(--red)' },
+};
+
+function spoke(from, to, power, dir, color) {
+  // dir: 'in' (toward home) | 'out' (away from home) | 'idle'
+  const a = NODES[from], b = NODES[to];
+  // Trim the line to circle edges.
+  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+  const ux = dx / len, uy = dy / len;
+  const x1 = a.x + ux * a.r, y1 = a.y + uy * a.r;
+  const x2 = b.x - ux * b.r, y2 = b.y - uy * b.r;
+  // Always draw the animated path from the OUTER node toward HOME so a decreasing
+  // dashoffset (flow-in) visually moves toward the house.
+  const path = `M ${x2} ${y2} L ${x1} ${y1}`; // home → outer
+  let base = `<path class="spoke-base" d="${path}"/>`;
+  if (dir === 'idle' || !power || power < 30) return base;
+  // speed: faster with more power (clamp 0.5s..2.2s over 0..4kW)
+  const spd = Math.max(0.5, 2.2 - (Math.min(power, 4000) / 4000) * 1.7).toFixed(2);
+  const cls = dir === 'in' ? 'flow-in' : 'flow-out';
+  return base + `<path class="flow ${cls}" style="--spd:${spd}s;stroke:${color}" d="${path}"/>`;
+}
+
+function node(key, opts) {
+  const n = NODES[key];
+  const glow = `<circle class="node-circle" cx="${n.x}" cy="${n.y}" r="${n.r}" fill="#0b1322" stroke="${opts.stroke || n.color}" stroke-width="3" style="filter:drop-shadow(0 0 7px ${opts.stroke || n.color})"/>`;
+  const icon = opts.icon || '';
+  const val = `<text class="node-val" x="${n.x}" y="${n.y + 20}" text-anchor="middle">${opts.val}</text>`;
+  const sub = opts.sub ? `<text class="node-sub" x="${n.x}" y="${n.y + 34}" text-anchor="middle">${opts.sub}</text>` : '';
+  return glow + icon + val + sub;
+}
+
+// Small inline icons, centred on the node's upper half.
+function solarIcon(x, y) {
+  return `<g stroke="var(--amber)" stroke-width="2.2" fill="none">
+    <rect x="${x-15}" y="${y-26}" width="30" height="20" rx="2"/>
+    <line x1="${x-5}" y1="${y-26}" x2="${x-5}" y2="${y-6}"/><line x1="${x+5}" y1="${y-26}" x2="${x+5}" y2="${y-6}"/>
+    <line x1="${x-15}" y1="${y-19}" x2="${x+15}" y2="${y-19}"/><line x1="${x-15}" y1="${y-12}" x2="${x+15}" y2="${y-12}"/>
+  </g>`;
+}
+function homeIcon(x, y) {
+  return `<g stroke="var(--teal)" stroke-width="2.4" fill="none" stroke-linejoin="round">
+    <path d="M ${x-17} ${y-8} L ${x} ${y-26} L ${x+17} ${y-8} L ${x+17} ${y+6} L ${x-17} ${y+6} Z"/>
+    <rect x="${x-6}" y="${y-7} " width="12" height="13"/>
+  </g>`;
+}
+function battIcon(x, y, soc, col) {
+  const w = 26, h = 14, fillW = Math.max(0, Math.min(1, (soc || 0) / 100)) * (w - 4);
+  return `<g><rect x="${x-w/2}" y="${y-24}" width="${w}" height="${h}" rx="2" fill="none" stroke="${col}" stroke-width="2"/>
+    <rect x="${x+w/2}" y="${y-21}" width="3" height="8" rx="1" fill="${col}"/>
+    <rect x="${x-w/2+2}" y="${y-22}" width="${fillW}" height="${h-4}" rx="1" fill="${col}"/></g>`;
+}
+function gridIcon(x, y, col) {
+  return `<g stroke="${col}" stroke-width="2.2" fill="none" stroke-linejoin="round">
+    <path d="M ${x-11} ${y-6} L ${x-7} ${y-26} L ${x+7} ${y-26} L ${x+11} ${y-6}"/>
+    <line x1="${x-9}" y1="${y-16}" x2="${x+9}" y2="${y-16}"/>
+    <path d="M ${x-7} ${y-26} L ${x+7} ${y-12} M ${x+7} ${y-26} L ${x-7} ${y-12}"/>
+  </g>`;
+}
+
+function renderFlow(live) {
+  const cap = window._cap || 9.5;
+  // Determine each spoke's flow.
+  const solarDir = live.solar_w > 30 ? 'in' : 'idle';
+  let battDir = 'idle', battPow = 0;
+  if (live.battery_discharge_w > 30) { battDir = 'in'; battPow = live.battery_discharge_w; }
+  else if (live.battery_charge_w > 30) { battDir = 'out'; battPow = live.battery_charge_w; }
+  let gridDir = 'idle', gridPow = 0;
+  if (live.grid_import_w > 30) { gridDir = 'in'; gridPow = live.grid_import_w; }
+  else if (live.grid_export_w > 30) { gridDir = 'out'; gridPow = live.grid_export_w; }
+
+  const gridImporting = live.grid_import_w > live.grid_export_w;
+  const gridCol = gridDir === 'idle' ? 'var(--muted)' : (gridImporting ? 'var(--red)' : 'var(--green)');
+  const battCol = battDir === 'out' ? 'var(--blue)' : (battDir === 'in' ? 'var(--orange)' : 'var(--blue)');
+
+  const spokes =
+    spoke('solar', 'home', live.solar_w, solarDir, 'var(--amber)') +
+    spoke('batt',  'home', battPow, battDir, battCol) +
+    spoke('grid',  'home', gridPow, gridDir, gridImporting ? 'var(--red)' : 'var(--green)');
+
+  const N = NODES;
+  const nodes =
+    node('solar', { icon: solarIcon(N.solar.x, N.solar.y), val: kW(live.solar_w) }) +
+    node('home',  { icon: homeIcon(N.home.x, N.home.y),   val: kW(live.load_w), sub: 'home load' }) +
+    node('batt',  { icon: battIcon(N.batt.x, N.batt.y, live.soc_pct, socColor(live.soc_pct)), stroke: socColor(live.soc_pct),
+                    val: (live.soc_pct == null ? '—' : live.soc_pct.toFixed(0) + '%'),
+                    sub: battDir === 'idle' ? `${num(live.soc_pct/100*cap)} kWh` : (battDir === 'out' ? '▲ ' : '▼ ') + kW(battPow) }) +
+    node('grid',  { icon: gridIcon(N.grid.x, N.grid.y, gridCol), stroke: gridCol,
+                    val: kW(gridDir === 'idle' ? 0 : gridPow),
+                    sub: gridDir === 'idle' ? 'idle' : (gridImporting ? '◀ import' : 'export ▶') });
+
+  return `<div class="flow-wrap"><svg class="flow-svg" viewBox="0 0 420 365" preserveAspectRatio="xMidYMid meet">
+    ${spokes}${nodes}
+  </svg></div>`;
+}
+
+// ── Sparklines ───────────────────────────────────────────────────────────────
+function sparkline(values, color, { fill = false, zeroBase = false } = {}) {
+  const v = values.filter(x => x != null);
+  if (v.length < 2) return '<svg viewBox="0 0 100 40"></svg>';
+  const W = 100, H = 40, pad = 3;
+  let lo = Math.min(...v), hi = Math.max(...v);
+  if (zeroBase) { lo = Math.min(0, lo); hi = Math.max(0, hi); }
+  if (hi - lo < 1e-9) hi = lo + 1;
+  const n = values.length;
+  const xs = i => pad + (i / (n - 1)) * (W - 2 * pad);
+  const ys = val => H - pad - ((val - lo) / (hi - lo)) * (H - 2 * pad);
+  let d = '', started = false;
+  values.forEach((val, i) => {
+    if (val == null) return;
+    d += (started ? ' L ' : 'M ') + xs(i).toFixed(1) + ' ' + ys(val).toFixed(1);
+    started = true;
+  });
+  let area = '';
+  if (fill) {
+    const y0 = zeroBase ? ys(0) : (H - pad);
+    area = `<path d="${d} L ${xs(n-1).toFixed(1)} ${y0.toFixed(1)} L ${xs(0).toFixed(1)} ${y0.toFixed(1)} Z" fill="${color}" opacity="0.12"/>`;
+  }
+  let zline = '';
+  if (zeroBase && lo < 0 && hi > 0) {
+    const zy = ys(0).toFixed(1);
+    zline = `<line x1="${pad}" y1="${zy}" x2="${W-pad}" y2="${zy}" stroke="var(--border)" stroke-width="0.7" stroke-dasharray="2 2"/>`;
+  }
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${zline}${area}<path d="${d}" fill="none" stroke="${color}" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+}
+
+// ── Render ───────────────────────────────────────────────────────────────────
+function modePill(mode, dhwOn) {
+  let cls = 'pill-eco', label = mode || 'ECO';
+  if (mode && mode.startsWith('CHARGE')) cls = 'pill-charge';
+  else if (mode && mode.startsWith('DISCHARGE')) cls = 'pill-dis';
+  return `<span class="pill ${cls}">${label}</span>`;
+}
+
+function feedFresh(name, age) {
+  // thresholds (good, warn) in seconds; negative age (future coverage) is good.
+  const T = { solar: [4*3600, 12*3600], weather: [3*3600, 12*3600], prices: [14*3600, 26*3600], consumption: [6*3600, 24*3600] };
+  const [good, warn] = T[name] || [3600, 12*3600];
+  let color = 'var(--muted)';
+  if (age != null) {
+    if (age <= good) color = 'var(--green)';
+    else if (age <= warn) color = 'var(--amber)';
+    else color = 'var(--red)';
+  }
+  return `<div class="feed"><span class="dot" style="background:${color}"></span><span class="name">${name}</span><span class="age">${fmtAge(age)}</span></div>`;
+}
+
+function render(d) {
+  window._cap = d.battery_capacity_kwh;
+  const live = d.live || {};
+  const dhw = d.dhw || {};
+  const pl = d.planner || {};
+  const cost = d.cost || {};
+
+  // Header badge
+  const sb = document.getElementById('status-badge');
+  if (live.online) { sb.className = 'badge badge-online'; sb.textContent = 'online'; }
+  else { sb.className = 'badge badge-offline'; sb.textContent = 'offline'; }
+  document.getElementById('updated').textContent =
+    'inverter ' + fmtAge(live.reading_age_s);
+
+  // ── Energy flow ──
+  const flowHtml = live.online || live.reading_age_s != null ? renderFlow(live) : '';
+
+  // ── Cards ──
+  const soc = live.soc_pct;
+  const socKwh = soc != null ? (soc / 100 * d.battery_capacity_kwh) : null;
+  const battCard = `
+    <div class="card">
+      <div class="card-head"><span class="card-label">Battery</span>
+        <span class="pill ${live.battery_net_w>30?'pill-dis':live.battery_net_w<-30?'pill-charge':'pill-off'}">
+          ${live.battery_net_w>30?'discharging':live.battery_net_w<-30?'charging':'idle'}</span></div>
+      <div class="card-value" style="color:${socColor(soc)}">${soc==null?'—':soc.toFixed(0)+'%'}</div>
+      <div class="soc-track"><div class="soc-fill" style="width:${Math.min(100,soc||0)}%;background:${socColor(soc)}"></div></div>
+      <div class="card-row" style="margin-top:8px"><span class="k">Stored</span><span class="v">${num(socKwh)} / ${num(d.battery_capacity_kwh,1)} kWh</span></div>
+      <div class="card-row"><span class="k">${live.battery_net_w>=0?'Discharge':'Charge'}</span><span class="v">${kW(Math.abs(live.battery_net_w))}</span></div>
+    </div>`;
+
+  const csign = pl.slot_cost_gbp;
+  const costCard = `
+    <div class="card">
+      <div class="card-head"><span class="card-label">Cost — this slot</span></div>
+      <div class="card-value ${costClass(csign)}">${csign==null?'—':(Math.abs(csign)<0.0005?'£0.00':gbp(csign))}</div>
+      <div class="card-row" style="margin-top:6px"><span class="k">Buy now</span><span class="v" style="color:${priceColor(pl.buy_p)}">${pl.buy_p==null?'—':pl.buy_p.toFixed(2)+'p'}</span></div>
+      <div class="card-row"><span class="k">Sell now</span><span class="v" style="color:${priceColor(pl.sell_p)}">${pl.sell_p==null?'—':pl.sell_p.toFixed(2)+'p'}</span></div>
+      <div class="card-row"><span class="k">Today so far</span><span class="v ${costClass(cost.today_gbp)}">${cost.today_gbp==null?'—':gbp(cost.today_gbp)}</span></div>
+      <div class="card-row"><span class="k">Yesterday</span><span class="v ${costClass(cost.yesterday_gbp)}">${cost.yesterday_gbp==null?'—':gbp(cost.yesterday_gbp)}</span></div>
+    </div>`;
+
+  const dhwTemp = dhw.tank_temp_c;
+  const dhwCard = `
+    <div class="card">
+      <div class="card-head"><span class="card-label">Hot water</span>
+        <span class="pill ${dhw.heating?'pill-on':'pill-off'}">${dhw.heating?'heating':(dhw.mode||'—')}</span></div>
+      <div class="card-value" style="color:var(--teal)">${dhwTemp==null?'—':dhwTemp.toFixed(1)+'°'}</div>
+      <div class="card-row" style="margin-top:6px"><span class="k">Target</span><span class="v">${dhw.target_temp_c==null?'—':dhw.target_temp_c.toFixed(1)+'°C'}</span></div>
+      <div class="card-row"><span class="k">Planned this slot</span><span class="v">${pl.dhw_on==null?'—':(pl.dhw_on?'ON':'off')}</span></div>
+      <div class="card-row"><span class="k">Reading</span><span class="v">${fmtAge(dhw.age_s)}</span></div>
+    </div>`;
+
+  const plannerCard = `
+    <div class="card">
+      <div class="card-head"><span class="card-label">Planner</span>${modePill(pl.mode, pl.dhw_on)}</div>
+      <div class="card-value" style="font-size:16px;margin-top:2px">${pl.has_decision===false?'no schedule':'optimized '+fmtAge(pl.last_optimization_age_s)}</div>
+      <div class="card-row" style="margin-top:6px"><span class="k">Pred. load</span><span class="v">${num(pl.predicted_load_kwh,2)} kWh</span></div>
+      <div class="card-row"><span class="k">Pred. solar</span><span class="v" style="color:var(--amber)">${num(pl.predicted_solar_kwh,2)} kWh</span></div>
+      <div class="card-row"><span class="k">Plan</span><span class="v">${pl.planned ? planSummary(pl.planned) : '—'}</span></div>
+    </div>`;
+
+  // ── Sparklines from history ──
+  const h = d.history || [];
+  const socSeries  = h.map(x => x.soc_pct);
+  const solarS = h.map(x => x.solar_w);
+  const loadS  = h.map(x => x.load_w);
+  const gridS  = h.map(x => x.grid_net_w);
+  const last = a => a.length ? a[a.length-1] : null;
+  const sparksHtml = h.length > 1 ? `
+    <section class="sparks">
+      ${sparkCard('Battery SoC', (last(socSeries)==null?'—':last(socSeries).toFixed(0)+'%'), sparkline(socSeries, socColor(last(socSeries)), {fill:true}))}
+      ${sparkCard('Solar', kW(last(solarS)), sparkline(solarS, 'var(--amber)', {fill:true}))}
+      ${sparkCard('Home load', kW(last(loadS)), sparkline(loadS, 'var(--teal)', {fill:true}))}
+      ${sparkCard('Grid (+imp/−exp)', kW(last(gridS)), sparkline(gridS, last(gridS)>=0?'var(--red)':'var(--green)', {zeroBase:true}))}
+    </section>` : '';
+
+  // ── Feeds ──
+  const feeds = d.feeds || {};
+  const feedsHtml = `<section class="card"><div class="card-label" style="margin-bottom:10px">Data feeds</div>
+    <div class="feeds">${['solar','weather','prices','consumption'].map(f => feedFresh(f, feeds[f])).join('')}</div></section>`;
+
+  // ── Upcoming price strip ──
+  const up = (d.upcoming || []).slice(0, 24);
+  let stripHtml = '';
+  if (up.length) {
+    const maxP = Math.max(5, ...up.map(s => s.buy_p));
+    const minP = Math.min(0, ...up.map(s => s.buy_p));
+    const bars = up.map(s => {
+      const hgt = 8 + ((s.buy_p - minP) / (maxP - minP || 1)) * 60;
+      return `<div class="bar ${s.is_current?'cur':''}">
+        <span class="p" style="color:${priceColor(s.buy_p)}">${s.buy_p.toFixed(0)}</span>
+        <div class="col" style="height:${hgt}px;background:${priceColor(s.buy_p)}"></div>
+        <span class="dhw ${s.dhw_on?'':'off'}" title="DHW"></span>
+        <span class="t">${s.time_uk}</span></div>`;
+    }).join('');
+    stripHtml = `<section class="strip-wrap"><div class="strip-title">Upcoming buy price (p/kWh) · teal dot = DHW planned</div><div class="strip">${bars}</div></section>`;
+  }
+
+  document.getElementById('app').innerHTML =
+    flowHtml +
+    `<section class="cards">${battCard}${costCard}${dhwCard}${plannerCard}</section>` +
+    sparksHtml +
+    stripHtml +
+    feedsHtml;
+
+  document.getElementById('foot-note').textContent =
+    'Updated ' + new Date(d.now).toLocaleTimeString('en-GB', {timeZone:'Europe/London'}) + ' · auto-refresh 5s';
+}
+
+function planSummary(p) {
+  const parts = [];
+  if (p.charge_kwh > 0.02) parts.push(`<span style="color:var(--blue)">chg ${p.charge_kwh.toFixed(2)}</span>`);
+  if (p.discharge_kwh > 0.02) parts.push(`<span style="color:var(--orange)">dis ${p.discharge_kwh.toFixed(2)}</span>`);
+  if (p.import_kwh > 0.02) parts.push(`<span style="color:var(--red)">imp ${p.import_kwh.toFixed(2)}</span>`);
+  if (p.export_kwh > 0.02) parts.push(`<span style="color:var(--green)">exp ${p.export_kwh.toFixed(2)}</span>`);
+  return parts.length ? parts.join(' · ') : 'idle';
+}
+
+function sparkCard(title, now, svg) {
+  return `<div class="spark"><div class="spark-head"><span class="spark-title">${title}</span><span class="spark-now">${now}</span></div>${svg}</div>`;
+}
+
+// ── Load & auto-refresh ──────────────────────────────────────────────────────
+function loadData() {
+  fetch('status.json?t=' + Date.now())
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(render)
+    .catch(err => {
+      document.getElementById('app').innerHTML = `
+        <div class="state-msg"><h2>No live data</h2>
+        <p>The daemon serves this page and <code>status.json</code> on its metrics port.</p>
+        <p>Start it with <code>uv run octoopt2-daemon</code> and open this page from that host.</p>
+        <p style="margin-top:8px;color:#64748b;font-size:11px">${err}</p></div>`;
+      const sb = document.getElementById('status-badge');
+      sb.textContent = 'no data'; sb.className = 'badge badge-loading';
+    });
+}
+
+loadData();
+setInterval(loadData, 5000);
+</script>
+</body>
+</html>

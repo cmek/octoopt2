@@ -207,6 +207,26 @@ Prometheus stores the time-series, so the high-frequency readings are not writte
 the SQLite database — only the existing 5-min `inverter_readings` (used by the
 optimizer) are persisted.
 
+#### Live dashboard
+
+The same HTTP server also hosts a single-page live dashboard at
+`http://<host>:9876/` (`web/status.html`). It renders, from the metric data and a
+short in-memory history of inverter readings:
+
+- an **energy-flow diagram** (solar / home / battery / grid) with animated spokes
+  whose direction follows the real power flow;
+- **battery**, **current-cost** (this slot's net cost, live buy/sell price, today's
+  and yesterday's totals), **hot-water** (tank temp, target, mode), and **planner**
+  (current mode, last-optimization age, planned action) cards;
+- **sparklines** for SoC, solar, home load and net grid flow over the last ~2 h;
+- the **upcoming buy-price** strip with DHW-planned markers; and
+- **data-feed freshness** indicators.
+
+It auto-refreshes every 5 s from `/status.json` (served same-origin, so no
+Prometheus query API or CORS setup is needed). The server also serves the existing
+`/index.html` (schedule) and `/accuracy.html` pages, so a single port covers
+metrics and all three dashboards.
+
 ### Cron job (legacy)
 
 If you prefer the stateless cron model instead of the daemon, the `octoopt2` entry
