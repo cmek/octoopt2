@@ -49,12 +49,13 @@ header nav { font-size: 12px; color: var(--muted); display: flex; gap: 10px; }
 .node-circle { transition: stroke 0.4s; }
 .node-val { font-size: 19px; font-weight: 700; fill: var(--text); }
 .node-sub { font-size: 11px; fill: var(--muted); }
-.spoke-base { fill: none; stroke: var(--border); stroke-width: 2; }
-.flow { fill: none; stroke-width: 3.5; stroke-linecap: round; stroke-dasharray: 1.5 13; }
-@keyframes flowin  { to { stroke-dashoffset: -300; } }
-@keyframes flowout { to { stroke-dashoffset:  300; } }
-.flow-in  { animation: flowin  var(--spd,1.4s) linear infinite; }
-.flow-out { animation: flowout var(--spd,1.4s) linear infinite; }
+.spoke-base { fill: none; stroke: var(--border); stroke-width: 1.6; opacity: 0.5; }
+/* One dash period (16 units); dots move source→sink at a speed set per-edge via
+   --spd. The path is always drawn from source to sink, so a decreasing dashoffset
+   carries the dots in the direction of the real power flow. */
+.flow { fill: none; stroke-width: 4; stroke-linecap: round; stroke-dasharray: 2.5 13.5; }
+@keyframes flowmove { to { stroke-dashoffset: -16; } }
+.flow-move { animation: flowmove var(--spd,4s) linear infinite; }
 
 /* ── Cards ── */
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-bottom: 16px; }
@@ -188,23 +189,88 @@ const NODES = {
   grid:  { x: 342, y: 300, r: 42, color: 'var(--red)' },
 };
 
-function spoke(from, to, power, dir, color) {
-  // dir: 'in' (toward home) | 'out' (away from home) | 'idle'
-  const a = NODES[from], b = NODES[to];
-  // Trim the line to circle edges.
-  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
-  const ux = dx / len, uy = dy / len;
-  const x1 = a.x + ux * a.r, y1 = a.y + uy * a.r;
-  const x2 = b.x - ux * b.r, y2 = b.y - uy * b.r;
-  // Always draw the animated path from the OUTER node toward HOME so a decreasing
-  // dashoffset (flow-in) visually moves toward the house.
-  const path = `M ${x2} ${y2} L ${x1} ${y1}`; // home → outer
-  let base = `<path class="spoke-base" d="${path}"/>`;
-  if (dir === 'idle' || !power || power < 30) return base;
-  // speed: faster with more power (clamp 0.5s..2.2s over 0..4kW)
-  const spd = Math.max(0.5, 2.2 - (Math.min(power, 4000) / 4000) * 1.7).toFixed(2);
-  const cls = dir === 'in' ? 'flow-in' : 'flow-out';
-  return base + `<path class="flow ${cls}" style="--spd:${spd}s;stroke:${color}" d="${path}"/>`;
+// Source-node colour for the dots travelling along an edge.
+const SRC_COLOR = { solar: 'var(--amber)', batt: 'var(--orange)', grid: 'var(--red)' };
+
+// Allocate aggregate power into per-edge flows. The inverter only reports node
+// totals (solar, load, battery charge/discharge, grid import/export), not how
+// power is routed between nodes, so we infer it: fill each sink (home, battery
+// charge, grid export) from the sources (solar, battery discharge, grid import)
+// in priority order. Battery charge/discharge and grid import/export are mutually
+// exclusive at the inverter, so the result is always physically consistent.
+function allocate(live) {
+  const src = {
+    solar: live.solar_w || 0,
+    batt:  live.battery_discharge_w || 0,
+    grid:  live.grid_import_w || 0,
+  };
+  const sinks = [
+    ['home', live.load_w || 0],
+    ['batt', live.battery_charge_w || 0],   // battery charging
+    ['grid', live.grid_export_w || 0],      // grid export
+  ];
+  const order = ['solar', 'batt', 'grid'];  // merit order: PV, then battery, then grid
+  const f = {};
+  for (const [sink, amt] of sinks) {
+    let need = amt;
+    for (const s of order) {
+      if (need <= 0) break;
+      if (s === sink) continue;             // no self-flow
+      const take = Math.min(src[s], need);
+      if (take <= 0) continue;
+      f[`${s}|${sink}`] = (f[`${s}|${sink}`] || 0) + take;
+      src[s] -= take; need -= take;
+    }
+  }
+  return f;
+}
+
+const _CX = 210, _CY = 192;  // diagram centre, for bulging the outer-ring arcs
+
+function _norm(x, y) { const l = Math.hypot(x, y) || 1; return { x: x / l, y: y / l }; }
+
+// Trimmed geometry between two nodes. Straight for spokes to Home; for the outer
+// ring (curved) the path bows away from the centre so the arcs don't overlap.
+function geom(aKey, bKey, curved) {
+  const a = NODES[aKey], b = NODES[bKey];
+  let ctrl = null;
+  if (curved) {
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    const o = _norm(mx - _CX, my - _CY);
+    ctrl = { x: mx + o.x * 50, y: my + o.y * 50 };
+  }
+  const at = curved ? ctrl : b, bt = curved ? ctrl : a;
+  const ad = _norm(at.x - a.x, at.y - a.y), bd = _norm(bt.x - b.x, bt.y - b.y);
+  return {
+    start: { x: a.x + ad.x * a.r, y: a.y + ad.y * a.r },
+    end:   { x: b.x + bd.x * b.r, y: b.y + bd.y * b.r },
+    ctrl,
+  };
+}
+
+function pathStr(g, reverse) {
+  const s = reverse ? g.end : g.start, e = reverse ? g.start : g.end;
+  const p = (q) => `${q.x.toFixed(1)} ${q.y.toFixed(1)}`;
+  return g.ctrl
+    ? `M ${p(s)} Q ${p(g.ctrl)} ${p(e)}`
+    : `M ${p(s)} L ${p(e)}`;
+}
+
+// Render one edge: a dim base line plus, when power flows, animated dots running
+// from the source node to the sink. Dots are slow; speed scales with power.
+function edge(aKey, bKey, curved, f) {
+  const g = geom(aKey, bKey, curved);
+  const base = `<path class="spoke-base" d="${pathStr(g, false)}"/>`;
+  // Pick the dominant direction on this undirected pair.
+  let power = f[`${aKey}|${bKey}`] || 0, source = aKey;
+  const rev = f[`${bKey}|${aKey}`] || 0;
+  if (rev > power) { power = rev; source = bKey; }
+  if (power < 25) return base;
+  // Slow flow: 8 px/s (low power) → 17 px/s (≥3.5 kW). Larger --spd = slower.
+  const pps = 8 + Math.min(power, 3500) / 3500 * 9;
+  const spd = (16 / pps).toFixed(2);
+  const reverse = source === bKey;  // base path is a→b; reverse if source is b
+  return base + `<path class="flow flow-move" style="--spd:${spd}s;stroke:${SRC_COLOR[source]}" d="${pathStr(g, reverse)}"/>`;
 }
 
 function node(key, opts) {
@@ -246,8 +312,7 @@ function gridIcon(x, y, col) {
 
 function renderFlow(live) {
   const cap = window._cap || 9.5;
-  // Determine each spoke's flow.
-  const solarDir = live.solar_w > 30 ? 'in' : 'idle';
+  // Node-level direction/colour (used for the circles' rings and sub-labels).
   let battDir = 'idle', battPow = 0;
   if (live.battery_discharge_w > 30) { battDir = 'in'; battPow = live.battery_discharge_w; }
   else if (live.battery_charge_w > 30) { battDir = 'out'; battPow = live.battery_charge_w; }
@@ -259,10 +324,17 @@ function renderFlow(live) {
   const gridCol = gridDir === 'idle' ? 'var(--muted)' : (gridImporting ? 'var(--red)' : 'var(--green)');
   const battCol = battDir === 'out' ? 'var(--blue)' : (battDir === 'in' ? 'var(--orange)' : 'var(--blue)');
 
+  // Per-edge flows inferred from the node totals. Three spokes to Home plus the
+  // outer ring (solar↔battery, solar↔grid, battery↔grid) so PV→grid export,
+  // grid→battery charging and battery→grid discharging are all shown directionally.
+  const f = allocate(live);
   const spokes =
-    spoke('solar', 'home', live.solar_w, solarDir, 'var(--amber)') +
-    spoke('batt',  'home', battPow, battDir, battCol) +
-    spoke('grid',  'home', gridPow, gridDir, gridImporting ? 'var(--red)' : 'var(--green)');
+    edge('solar', 'home', false, f) +
+    edge('batt',  'home', false, f) +
+    edge('grid',  'home', false, f) +
+    edge('solar', 'batt', true,  f) +
+    edge('solar', 'grid', true,  f) +
+    edge('batt',  'grid', true,  f);
 
   const N = NODES;
   const nodes =
@@ -275,7 +347,7 @@ function renderFlow(live) {
                     val: kW(gridDir === 'idle' ? 0 : gridPow),
                     sub: gridDir === 'idle' ? 'idle' : (gridImporting ? '◀ import' : 'export ▶') });
 
-  return `<div class="flow-wrap"><svg class="flow-svg" viewBox="0 0 420 365" preserveAspectRatio="xMidYMid meet">
+  return `<div class="flow-wrap"><svg class="flow-svg" viewBox="0 0 420 374" preserveAspectRatio="xMidYMid meet">
     ${spokes}${nodes}
   </svg></div>`;
 }
