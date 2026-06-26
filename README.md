@@ -157,17 +157,66 @@ uv run octoopt2 --dry-run
 uv run octoopt2
 ```
 
-### Cron job
+### Daemon (recommended)
+
+Run octoopt2 as a long-lived background process instead of cron. It performs the
+same fast (5-min) and slow (30-min) optimizer tasks itself, and additionally polls
+the inverter every 30 s to expose near-live statistics as Prometheus metrics:
 
 ```bash
-crontab -e
+uv run octoopt2-daemon
 ```
 
-Add:
+The daemon does **not** hold a persistent connection to the inverter. A GivEnergy
+inverter accepts only one Modbus TCP connection at a time, so the daemon opens a
+short-lived connection only when it polls or applies a command — exactly like the
+cron job did — leaving the socket free for other tools (GivTCP, Home Assistant, a
+manual `uv run octoopt2 --dry-run`) between polls. A single internal lock keeps the
+30 s poller and the 5-min optimizer tick from connecting at the same instant.
+
+> The daemon **replaces** cron. Remove any `*/5 * * * * … uv run octoopt2` crontab
+> line before starting it — the two cannot run simultaneously (single connection).
+
+Flags: `--no-dhw` (see below), `--output` (write `web/schedule.json` each tick),
+`--dry-run` (optimize and poll, but send no commands), `--metrics-port N`.
+
+Supervise it however you like (systemd, tmux, `nohup`, a container). It logs to
+stdout and shuts down cleanly on SIGINT/SIGTERM.
+
+#### Prometheus metrics
+
+The daemon serves Prometheus metrics at `http://<host>:9876/metrics` (port set via
+`METRICS_PORT`). Exposed gauges include live inverter power flows and SoC
+(`octoopt2_load_watts`, `octoopt2_solar_power_watts`, `octoopt2_battery_soc_percent`,
+grid import/export, battery charge/discharge), Ecodan tank temperatures and mode
+(`octoopt2_dhw_tank_temp_celsius`, `octoopt2_dhw_mode`), the current slot's planned
+action and cost (`octoopt2_planned_*`, `octoopt2_planned_slot_cost_gbp`), and data-feed
+freshness (`octoopt2_feed_age_seconds`, `octoopt2_last_optimization_age_seconds`).
+
+Example scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: octoopt2
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["192.168.1.x:9876"]
+```
+
+Prometheus stores the time-series, so the high-frequency readings are not written to
+the SQLite database — only the existing 5-min `inverter_readings` (used by the
+optimizer) are persisted.
+
+### Cron job (legacy)
+
+If you prefer the stateless cron model instead of the daemon, the `octoopt2` entry
+point still works tick-by-tick:
 
 ```
 */5 * * * * cd /path/to/octoopt2 && uv run octoopt2 >> /var/log/octoopt2.log 2>&1
 ```
+
+Do not run the cron job and the daemon at the same time.
 
 ### DHW-only mode
 

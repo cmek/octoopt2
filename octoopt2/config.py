@@ -125,6 +125,25 @@ class MelCloudConfig:
 
 
 @dataclass(frozen=True)
+class DaemonConfig:
+    """Tunables for the long-running daemon (octoopt2-daemon)."""
+    # Port the Prometheus /metrics HTTP server listens on
+    metrics_port: int = 9876
+    # How often to poll the inverter for live metrics (seconds)
+    inverter_poll_seconds: int = 30
+    # How often to poll MELCloud for DHW state (seconds) — keep modest, cloud API
+    ecodan_poll_seconds: int = 300
+
+    @classmethod
+    def from_env(cls) -> "DaemonConfig":
+        return cls(
+            metrics_port=int(os.getenv("METRICS_PORT", "9876")),
+            inverter_poll_seconds=int(os.getenv("INVERTER_POLL_SECONDS", "30")),
+            ecodan_poll_seconds=int(os.getenv("ECODAN_POLL_SECONDS", "300")),
+        )
+
+
+@dataclass(frozen=True)
 class LocationConfig:
     latitude: float
     longitude: float
@@ -146,6 +165,7 @@ class AppConfig:
     battery: BatteryConfig
     dhw: DhwConfig
     location: LocationConfig
+    daemon: DaemonConfig
     db_path: str
     # Slot duration in minutes (Octopus Agile is half-hourly)
     slot_minutes: int = 30
@@ -160,5 +180,6 @@ class AppConfig:
             battery=BatteryConfig(),
             dhw=DhwConfig.from_env(),
             location=LocationConfig.from_env(),
+            daemon=DaemonConfig.from_env(),
             db_path=os.getenv("DB_PATH", "octoopt2.db"),
         )

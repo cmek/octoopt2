@@ -9,6 +9,7 @@ dependencies = [
     "holidays>=0.93",
     "numpy>=2.4.4",
     "openmeteo-requests>=1.7.5",
+    "prometheus-client>=0.21",
     "pulp>=3.3.0",
     "pymelcloud>=2.11.0",
     "python-dotenv>=1.2.2",
@@ -19,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 octoopt2 = "octoopt2.main:main"
+octoopt2-daemon = "octoopt2.daemon:main"
 octoopt2-setup = "scripts.setup:main"
 octoopt2-preload-consumption = "scripts.preload_consumption:main"
 octoopt2-report = "scripts.report:main"
