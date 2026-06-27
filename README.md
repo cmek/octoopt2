@@ -81,6 +81,22 @@ After each optimization run the current slot's decision is translated into inver
 
 Charge/discharge power is mapped to the inverter's 1–50 register scale proportional to the battery's configured max rate.
 
+#### Battery reserve floor (minimum SoC)
+
+There are **two** floors, and only one is a hard limit:
+
+- **`min_soc_pct`** (in `BatteryConfig`, default 10%) is a *planning* constraint inside the optimizer's LP. It shapes what the optimizer intends but is never written to the inverter, so it cannot physically stop a discharge.
+- The **inverter's hardware reserve** (`BATTERY_SOC_RESERVE` + `BATTERY_DISCHARGE_MIN_POWER_RESERVE`) is the real floor. The inverter refuses to discharge below it in any mode. GivEnergy ships this at **4%**, which is why an unconfigured battery drains to ~5%.
+
+To enforce a higher hard floor, set the hardware reserve with the one-off command:
+
+```bash
+uv run octoopt2-set-reserve         # show current SoC + reserve, change nothing
+uv run octoopt2-set-reserve 10      # set the hardware reserve floor to 10%
+```
+
+The value persists in the inverter's flash until changed again. Keep `min_soc_pct` equal to (or just above) the hardware reserve so the plan and the hardware agree.
+
 ### Persistence
 
 All data is stored in a local SQLite database (WAL mode). Tables:
@@ -312,4 +328,5 @@ scripts/
   report.py                  — daily performance report
   accuracy_report.py         — forecast accuracy and cost outcomes report
   preload_consumption.py     — bulk-load historical consumption
+  set_reserve.py             — set the inverter's hardware battery reserve floor
 ```

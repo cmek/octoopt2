@@ -150,6 +150,31 @@ def apply_decision(
     )
 
 
+def set_battery_reserve(config: GivEnergyConfig, pct: int) -> None:
+    """Set the inverter's hardware minimum-SoC reserve (the hard discharge floor).
+
+    Writes BOTH reserve registers so the floor is enforced regardless of mode:
+      • BATTERY_SOC_RESERVE              — the "Battery Reserve %" shown in the app
+      • BATTERY_DISCHARGE_MIN_POWER_RESERVE — the discharge-side power reserve
+
+    This is a one-off device setting: the inverter holds it in flash until
+    changed again. The optimizer's ``min_soc_pct`` only shapes the *plan*; this
+    is the physical limit that actually stops the battery discharging. Keep the
+    two in sync (set ``min_soc_pct`` >= this value) so plan and hardware agree.
+
+    Valid range is 4–100% (enforced by the underlying commands).
+    """
+    if not 4 <= pct <= 100:
+        raise ValueError(f"Reserve must be in [4, 100]%, got {pct}")
+    logger.info("Inverter → set battery reserve floor to %d%%", pct)
+    reqs = [
+        *commands.set_battery_soc_reserve(pct),
+        *commands.set_battery_power_reserve(pct),
+    ]
+    _run_with_retry(config, reqs)
+    logger.info("Inverter: battery reserve floor set to %d%%", pct)
+
+
 # ── Command builders ──────────────────────────────────────────────────────────
 
 def _cmds_charge(charge_kw: float, limit: int, last_mode: str | None) -> list:
