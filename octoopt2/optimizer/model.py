@@ -193,6 +193,18 @@ def optimize(
         prob += grid_import[t] <= max_import_kwh * is_importing[t]
         prob += grid_export[t] <= max_export_kwh * (1 - is_importing[t])
 
+        # ── No grid round-tripping during negative-import slots ────────────
+        # When buy_price < 0 the optimizer is *paid* to import. If export were a
+        # free energy sink it would churn the battery — import+charge one slot,
+        # discharge+export the next — purely to harvest import payments
+        # (grid → battery → grid). Cap export to genuine solar surplus in these
+        # slots so it can never re-export battery- or grid-sourced energy. The
+        # cap is always satisfiable (excess solar = solar − load − bat_charge ≤
+        # solar), so it cannot make the problem infeasible. Positive-price slots
+        # are unconstrained here and keep full battery-export arbitrage.
+        if inputs.buy_prices[t] < 0:
+            prob += grid_export[t] <= solar_t
+
     # ── DHW daily minimums and maximums ───────────────────────────────────
     if manage_dhw:
         for day_slots in _group_slots_by_day(inputs.slot_starts):

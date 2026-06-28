@@ -134,8 +134,18 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     for slot in slot_starts:
         slot_utc = slot.astimezone(timezone.utc)
         p = price_map.get(slot_utc, {})
-        buy_prices.append(p.get("buy_gbp_kwh", 0.30))
-        sell_prices.append(p.get("sell_gbp_kwh", 0.0))
+        buy = p.get("buy_gbp_kwh", 0.30)
+        # Outgoing rate unknown (slot absent, or sell is NULL = not yet
+        # published)? Default pessimistically to the import price rather than 0.
+        # A 0 export price makes grid export look like a free energy sink, which
+        # the optimizer exploits to round-trip the battery during negative-import
+        # slots; mirroring buy removes that incentive until the real rate is
+        # fetched and the schedule is recomputed.
+        sell = p.get("sell_gbp_kwh")
+        if sell is None:
+            sell = buy
+        buy_prices.append(buy)
+        sell_prices.append(sell)
         solar_forecast.append(solar_map.get(slot_utc, 0.0))
 
         if load_model:
@@ -565,10 +575,13 @@ def _record_actuals(config: AppConfig, now: datetime) -> None:
 
         cost_gbp = None
         if price_row:
-            cost_gbp = (
-                price_row["buy_gbp_kwh"] * import_kwh
-                - price_row["sell_gbp_kwh"] * export_kwh
-            )
+            # sell may be NULL if the outgoing rate was never published for this
+            # slot; mirror the import price (the same pessimistic default the
+            # optimizer used) so the recorded cost stays consistent with the plan.
+            sell = price_row["sell_gbp_kwh"]
+            if sell is None:
+                sell = price_row["buy_gbp_kwh"]
+            cost_gbp = price_row["buy_gbp_kwh"] * import_kwh - sell * export_kwh
 
         conn.execute(
             """
