@@ -9,7 +9,10 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS prices (
     slot_start  TEXT NOT NULL,   -- ISO8601 UTC, e.g. "2024-01-15T14:00:00+00:00"
     buy_gbp_kwh  REAL NOT NULL,
-    sell_gbp_kwh REAL NOT NULL,
+    -- NULL = outgoing (export) rate not yet published. Distinct from a genuine
+    -- 0.0 rate: callers default a NULL pessimistically (mirror the import price)
+    -- rather than treating export as a free energy sink. See data/octopus.py.
+    sell_gbp_kwh REAL,
     PRIMARY KEY (slot_start)
 );
 
@@ -127,6 +130,30 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
     except sqlite3.OperationalError:
         pass  # column already exists
+
+    # prices.sell_gbp_kwh was originally NOT NULL with a 0.0 placeholder for the
+    # not-yet-published outgoing rate. That placeholder is indistinguishable from
+    # a genuine 0.0 export price, so the optimizer treated unpublished slots as a
+    # free export sink. Make the column nullable (NULL = "unknown") so callers
+    # can default it pessimistically. SQLite can't drop NOT NULL via ALTER, so
+    # rebuild the table. Idempotent: only runs while the column is still NOT NULL.
+    cols = conn.execute("PRAGMA table_info(prices)").fetchall()
+    sell_col = next((c for c in cols if c[1] == "sell_gbp_kwh"), None)
+    if sell_col is not None and sell_col[3] == 1:  # c[3] == notnull flag
+        conn.executescript(
+            """
+            CREATE TABLE prices_new (
+                slot_start  TEXT NOT NULL,
+                buy_gbp_kwh  REAL NOT NULL,
+                sell_gbp_kwh REAL,
+                PRIMARY KEY (slot_start)
+            );
+            INSERT INTO prices_new (slot_start, buy_gbp_kwh, sell_gbp_kwh)
+                SELECT slot_start, buy_gbp_kwh, sell_gbp_kwh FROM prices;
+            DROP TABLE prices;
+            ALTER TABLE prices_new RENAME TO prices;
+            """
+        )
 
 
 @contextmanager

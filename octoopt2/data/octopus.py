@@ -115,7 +115,11 @@ def fetch_and_store_prices(
     for r in buy_rates:
         slot = _normalise_slot(r["valid_from"])
         buy_gbp = r["value_inc_vat"] / 100
-        sell_gbp = sell_by_slot.get(slot, 0.0)
+        # None (→ NULL) when the outgoing rate for this slot isn't published yet.
+        # Never default to 0.0: a 0 export price is indistinguishable from a free
+        # export sink and lets the optimizer round-trip the battery during
+        # negative-import slots. Callers default a NULL pessimistically instead.
+        sell_gbp = sell_by_slot.get(slot)
         rows.append((slot, buy_gbp, sell_gbp))
 
     if not rows:
@@ -136,12 +140,13 @@ def fetch_and_store_prices(
                 rows,
             )
         else:
-            # Sell rates not yet published — only upsert buy price, preserve
-            # any sell price already stored so we don't overwrite with 0.0
+            # Sell rates not yet published — upsert buy price with sell = NULL
+            # (unknown), preserving any sell price already stored so we don't
+            # clobber a real rate fetched earlier.
             conn.executemany(
                 """
                 INSERT INTO prices (slot_start, buy_gbp_kwh, sell_gbp_kwh)
-                VALUES (?, ?, 0.0)
+                VALUES (?, ?, NULL)
                 ON CONFLICT(slot_start) DO UPDATE SET
                     buy_gbp_kwh = excluded.buy_gbp_kwh
                 """,
@@ -189,8 +194,10 @@ def missing_price_dates(db_path: str, look_ahead_days: int = 2) -> list[date]:
 
     A date needs fetching if:
     - it has no buy prices at all, OR
-    - it has buy prices but all sell prices are 0.0 (fetched before sell rates
-      were published, or before the correct outgoing tariff was configured)
+    - any slot is missing its outgoing (sell) rate, i.e. sell_gbp_kwh IS NULL
+      (fetched before sell rates were published, or before the correct outgoing
+      tariff was configured). A genuine 0.0 or negative rate counts as known and
+      is not re-fetched.
     """
     today = datetime.now(LONDON).date()
     missing = []
@@ -201,13 +208,13 @@ def missing_price_dates(db_path: str, look_ahead_days: int = 2) -> list[date]:
             row = conn.execute(
                 """
                 SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN sell_gbp_kwh > 0 THEN 1 ELSE 0 END) AS with_sell
+                       SUM(CASE WHEN sell_gbp_kwh IS NOT NULL THEN 1 ELSE 0 END) AS with_sell
                 FROM prices
                 WHERE slot_start >= ? AND slot_start < ?
                 """,
                 (period_from.isoformat(), period_to.isoformat()),
             ).fetchone()
-        if row["total"] == 0 or row["with_sell"] == 0:
+        if row["total"] == 0 or row["with_sell"] < row["total"]:
             missing.append(d)
     return missing
 
