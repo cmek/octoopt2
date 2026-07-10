@@ -118,6 +118,16 @@ it detects a daemon on the local metrics port — a running daemon would overwri
 the away state on its next tick. Flags: `--reserve N` (default 20), `--no-dhw`,
 `--dry-run`, `--force`.
 
+To confirm everything is (still) set correctly — before leaving, or later over
+SSH — run the read-only check; it writes nothing and prints PASS/FAIL for each
+condition (daemon stopped, ECO on, forced discharge off, both reserve registers,
+DHW auto), exiting 0 only when all pass:
+
+```bash
+uv run octoopt2-away --check                # expects the default 20% reserve
+uv run octoopt2-away --check --reserve 30   # if you applied a different floor
+```
+
 In ECO mode the battery self-consumes solar and never force-imports or
 force-exports. The Ecodan in `auto` follows its own onboard schedule; for a long
 absence consider also setting MELCloud's holiday mode with your return date.

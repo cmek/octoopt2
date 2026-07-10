@@ -27,8 +27,15 @@ Usage:
     uv run octoopt2-away --no-dhw        # skip the MELCloud call
     uv run octoopt2-away --dry-run       # print intended actions, write nothing
     uv run octoopt2-away --force         # proceed even if a daemon is detected
+    uv run octoopt2-away --check         # read-only: verify the away state is in place
 
-Exit codes: 0 ok, 1 hardware/cloud failure, 2 bad args, 3 daemon detected.
+--check writes nothing. It probes for a running daemon, reads the inverter
+registers and the DHW mode, and prints PASS/FAIL per condition — run it after
+applying the away state (or from your phone via SSH while travelling) to
+confirm everything is still set correctly.
+
+Exit codes: 0 ok, 1 hardware/cloud failure or check failed, 2 bad args,
+3 daemon detected.
 """
 import argparse
 import asyncio
@@ -54,12 +61,45 @@ async def _read_away_state(config) -> dict:
         return {
             "soc": int(inv.battery_percent),
             "eco_mode": int(inv.eco_mode),
+            "enable_charge": bool(inv.enable_charge),
             "enable_discharge": bool(inv.enable_discharge),
             "soc_reserve": int(inv.battery_soc_reserve),
             "power_reserve": int(inv.battery_discharge_min_power_reserve),
         }
     finally:
         await client.close()
+
+
+def _print_state(state: dict) -> None:
+    print(f"Current SoC:                 {state['soc']}%")
+    print(f"Eco mode:                    {state['eco_mode']}")
+    print(f"AC charge enabled:           {state['enable_charge']}")
+    print(f"Forced discharge enabled:    {state['enable_discharge']}")
+    print(f"Battery reserve (SoC):       {state['soc_reserve']}%")
+    print(f"Discharge min power reserve: {state['power_reserve']}%")
+
+
+def _inverter_checks(state: dict, reserve: int) -> list[tuple[str, bool]]:
+    """The register conditions that define the away state.
+
+    AC charge enable is deliberately not checked: in ECO (dynamic) mode the
+    inverter self-consumes regardless of it, and production runs fine with
+    either value — so it is printed for information only.
+    """
+    return [
+        ("Eco mode on", state["eco_mode"] == 1),
+        ("Forced discharge off", not state["enable_discharge"]),
+        (f"SoC reserve {reserve}%", state["soc_reserve"] == reserve),
+        (f"Power reserve {reserve}%", state["power_reserve"] == reserve),
+    ]
+
+
+def _print_checks(checks: list[tuple[str, bool]]) -> bool:
+    all_ok = True
+    for label, ok in checks:
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+        all_ok = all_ok and ok
+    return all_ok
 
 
 def _daemon_running(metrics_port: int) -> bool:
@@ -88,12 +128,50 @@ def main() -> int:
     parser.add_argument("--no-dhw", action="store_true", help="Skip the MELCloud DHW call")
     parser.add_argument("--dry-run", action="store_true", help="Print intended actions, write nothing")
     parser.add_argument("--force", action="store_true", help="Proceed even if a daemon is detected")
+    parser.add_argument(
+        "--check", action="store_true",
+        help="Read-only: verify the away state (daemon stopped, ECO, reserve, DHW auto) and exit",
+    )
     args = parser.parse_args()
 
     if not 4 <= args.reserve <= 100:
         parser.error(f"--reserve must be in [4, 100], got {args.reserve}")
 
     config = AppConfig.from_env()
+
+    # ── Read-only check mode ────────────────────────────────────────────────
+    if args.check:
+        all_ok = True
+
+        daemon_up = _daemon_running(config.daemon.metrics_port)
+        print(f"  {'FAIL' if daemon_up else 'PASS'}  Daemon not running (port {config.daemon.metrics_port})")
+        if daemon_up:
+            print("        A running daemon overwrites the away state on its next tick.")
+            all_ok = False
+
+        try:
+            state = asyncio.run(_read_away_state(config.givenergy))
+        except Exception as exc:
+            logger.error("Failed to read inverter: %s", exc)
+            return 1
+        print()
+        _print_state(state)
+        print()
+        all_ok = _print_checks(_inverter_checks(state, args.reserve)) and all_ok
+
+        if not args.no_dhw:
+            try:
+                dhw = get_dhw_state(config.melcloud)
+            except Exception as exc:
+                logger.error("Failed to read DHW state from MELCloud: %s", exc)
+                return 1
+            mode = dhw.get("operation_mode")
+            ok = mode == "auto"
+            print(f"  {'PASS' if ok else 'FAIL'}  DHW auto (mode {mode!r}, tank {dhw.get('tank_temperature')}°C)")
+            all_ok = all_ok and ok
+
+        print(f"\n{'All checks passed — away state is in place.' if all_ok else 'CHECK FAILED — run octoopt2-away to (re)apply the away state.'}")
+        return 0 if all_ok else 1
 
     # ── 1. Refuse to fight a running daemon ────────────────────────────────
     if _daemon_running(config.daemon.metrics_port):
@@ -116,11 +194,7 @@ def main() -> int:
         logger.error("Failed to read inverter: %s", exc)
         return 1
 
-    print(f"Current SoC:                 {before['soc']}%")
-    print(f"Eco mode:                    {before['eco_mode']}")
-    print(f"Forced discharge enabled:    {before['enable_discharge']}")
-    print(f"Battery reserve (SoC):       {before['soc_reserve']}%")
-    print(f"Discharge min power reserve: {before['power_reserve']}%")
+    _print_state(before)
 
     if args.dry_run:
         print("\nDry-run — would do:")
@@ -143,17 +217,7 @@ def main() -> int:
         logger.error("Commands sent but verification read failed: %s", exc)
         return 1
 
-    checks = [
-        ("Eco mode on", after["eco_mode"] == 1),
-        ("Forced discharge off", not after["enable_discharge"]),
-        (f"SoC reserve {args.reserve}%", after["soc_reserve"] == args.reserve),
-        (f"Power reserve {args.reserve}%", after["power_reserve"] == args.reserve),
-    ]
-    all_ok = True
-    for label, ok in checks:
-        print(f"  {'PASS' if ok else 'FAIL'}  {label}")
-        all_ok = all_ok and ok
-    if not all_ok:
+    if not _print_checks(_inverter_checks(after, args.reserve)):
         logger.error("Inverter writes were sent but did not verify — check the GivEnergy app")
         return 1
 
