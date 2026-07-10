@@ -97,6 +97,37 @@ uv run octoopt2-set-reserve 10      # set the hardware reserve floor to 10%
 
 The value persists in the inverter's flash until changed again. Keep `min_soc_pct` equal to (or just above) the hardware reserve so the plan and the hardware agree.
 
+> Note: every time the daemon switches the inverter to ECO mode it also writes the
+> SoC reserve register (to 4% by default), so a manually set reserve only survives
+> while the daemon is stopped. Use `octoopt2-away` (below) when leaving the system
+> unattended — it writes ECO and the reserve floor together.
+
+#### Away mode (leaving the system unattended)
+
+The inverter follows its last-written registers autonomously, so it needs no
+server or internet once left in a safe state. Before going away for an extended
+period:
+
+```bash
+sudo systemctl disable --now octoopt2-daemon   # stop AND disable, so a reboot doesn't resurrect it
+uv run octoopt2-away --reserve 20              # inverter → ECO + 20% reserve floor, DHW → auto
+```
+
+The command verifies each register after writing and refuses to run (exit 3) if
+it detects a daemon on the local metrics port — a running daemon would overwrite
+the away state on its next tick. Flags: `--reserve N` (default 20), `--no-dhw`,
+`--dry-run`, `--force`.
+
+In ECO mode the battery self-consumes solar and never force-imports or
+force-exports. The Ecodan in `auto` follows its own onboard schedule; for a long
+absence consider also setting MELCloud's holiday mode with your return date.
+
+As a backstop, the daemon applies the same safe state (ECO + DHW auto) on every
+shutdown — a `systemctl stop`, host reboot, or crash-exit lands the hardware in
+ECO rather than a stuck force-charge/force-export window. This fallback restores
+the default 4% reserve, not a custom floor — hence the explicit `octoopt2-away`
+step above.
+
 ### Persistence
 
 All data is stored in a local SQLite database (WAL mode). Tables:
@@ -197,7 +228,12 @@ Flags: `--no-dhw` (see below), `--output` (write `web/schedule.json` each tick),
 `--dry-run` (optimize and poll, but send no commands), `--metrics-port N`.
 
 Supervise it however you like (systemd, tmux, `nohup`, a container). It logs to
-stdout and shuts down cleanly on SIGINT/SIGTERM.
+stdout and shuts down cleanly on SIGINT/SIGTERM. On shutdown it applies a safe
+fallback — inverter → ECO, DHW → auto (skipped under `--dry-run`, DHW part
+skipped under `--no-dhw`) — so a stop or reboot never strands the inverter in a
+force-charge/force-export window. Worst case this takes ~60 s against an
+unreachable inverter, so if you run it under systemd keep `TimeoutStopSec` at
+75 s or more (the systemd default of 90 s is fine).
 
 #### Prometheus metrics
 

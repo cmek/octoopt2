@@ -165,7 +165,7 @@ async def _poll_inverter_loop(config: AppConfig, state: DaemonState) -> None:
     while True:
         try:
             async with state.inverter_lock:
-                reading = await asyncio.to_thread(read_inverter, config.givenergy)
+                reading = await _run_in_daemon_thread(read_inverter, config.givenergy)
             state.latest_reading = reading
             state.history.append(reading)
             logger.debug(
@@ -218,7 +218,7 @@ async def _optimizer_loop(
             await asyncio.sleep(_seconds_until_next(_TICK_SECONDS))
         try:
             async with state.inverter_lock:
-                await asyncio.to_thread(
+                await _run_in_daemon_thread(
                     scheduler.run,
                     config,
                     dry_run,
@@ -227,6 +227,39 @@ async def _optimizer_loop(
                 )
         except Exception as exc:
             logger.exception("Optimizer tick failed: %s", exc)
+
+
+async def _run_in_daemon_thread(fn, *args):
+    """Run fn(*args) in a daemon thread and await its result, cancellably.
+
+    Deliberately NOT asyncio.to_thread: executor threads are joined when
+    asyncio.run() tears the loop down, so a long in-flight call (e.g. a
+    first-run price backfill taking minutes) would block SIGTERM shutdown
+    until it finished — past systemd's kill timeout, skipping the shutdown
+    safe fallback. A daemon thread is abandoned on cancellation instead; the
+    process exits without waiting for it.
+    """
+    loop = asyncio.get_running_loop()
+    done = asyncio.Event()
+    result: list = []
+    err: list[BaseException] = []
+
+    def _target() -> None:
+        try:
+            result.append(fn(*args))
+        except BaseException as exc:  # noqa: BLE001 — re-raised on the loop side
+            err.append(exc)
+        finally:
+            try:
+                loop.call_soon_threadsafe(done.set)
+            except RuntimeError:  # loop already closed during shutdown
+                pass
+
+    threading.Thread(target=_target, name=f"worker-{fn.__name__}", daemon=True).start()
+    await done.wait()
+    if err:
+        raise err[0]
+    return result[0]
 
 
 async def _run(
@@ -271,7 +304,42 @@ async def _run(
     logger.info("Shutdown signal received — stopping loops")
     for task in tasks:
         task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        # An in-flight optimizer tick keeps running in its (abandoned) daemon
+        # thread; the short inverter/ecodan polls may take a few seconds to
+        # unwind — bound the wait so shutdown can't stall.
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=15)
+    except asyncio.TimeoutError:
+        logger.warning("Loops did not stop within 15s — proceeding to shutdown fallback")
+
+
+def _apply_shutdown_fallback(
+    config: AppConfig, manage_dhw: bool, dry_run: bool, timeout_s: float = 45.0
+) -> None:
+    """Best-effort safe state on exit: inverter → ECO, DHW → auto.
+
+    Runs in a daemon thread with a join timeout so an unreachable inverter or
+    MELCloud cannot hang systemctl stop / host shutdown. Must run after
+    asyncio.run() has returned — the underlying control helpers each start
+    their own event loop via asyncio.run().
+    """
+    if dry_run:
+        logger.info("Dry-run — skipping shutdown safe fallback")
+        return
+    logger.info(
+        "Applying shutdown safe fallback (inverter → ECO, DHW → auto; timeout %.0fs)", timeout_s
+    )
+    t = threading.Thread(
+        target=scheduler._apply_safe_fallback,
+        args=(config,),
+        kwargs={"manage_dhw": manage_dhw},
+        name="shutdown-fallback",
+        daemon=True,
+    )
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        logger.warning("Shutdown fallback did not complete within %.0fs — exiting anyway", timeout_s)
 
 
 def main() -> None:
@@ -317,6 +385,8 @@ def main() -> None:
         )
     except KeyboardInterrupt:  # pragma: no cover
         pass
+    finally:
+        _apply_shutdown_fallback(config, manage_dhw=not args.no_dhw, dry_run=args.dry_run)
     logger.info("Daemon stopped")
 
 
