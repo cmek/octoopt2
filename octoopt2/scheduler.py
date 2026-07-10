@@ -117,7 +117,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     slot_starts = _remaining_slots(config.db_path, now)
     if not slot_starts:
         logger.warning("No price data for upcoming slots — skipping optimization")
-        _apply_safe_fallback(config)
+        _apply_safe_fallback(config, manage_dhw=manage_dhw, dry_run=dry_run)
         return
 
     logger.info("Optimizing %d slots from %s", len(slot_starts), slot_starts[0].strftime("%H:%M"))
@@ -177,7 +177,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         )
     except Exception as exc:
         logger.error("Optimizer failed: %s — applying safe fallback", exc)
-        _apply_safe_fallback(config)
+        _apply_safe_fallback(config, manage_dhw=manage_dhw, dry_run=dry_run)
         return
 
     # ── 8. Save schedule / write output ───────────────────────────────────
@@ -200,7 +200,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     decision = get_current_decision(config.db_path, now=now)
     if decision is None:
         logger.warning("No decision found for current slot — applying safe fallback")
-        _apply_safe_fallback(config)
+        _apply_safe_fallback(config, manage_dhw=manage_dhw, dry_run=dry_run)
         return
 
     logger.info(
@@ -517,19 +517,26 @@ def _remaining_slots(db_path: str, now: datetime) -> list[datetime]:
     return [p["slot_start"].astimezone(timezone.utc) for p in prices]
 
 
-def _apply_safe_fallback(config: AppConfig) -> None:
-    """Apply a safe state when the optimizer cannot run: eco mode, DHW off."""
-    logger.info("Applying safe fallback: eco mode, DHW off")
+def _apply_safe_fallback(config: AppConfig, *, manage_dhw: bool = True, dry_run: bool = False) -> None:
+    """Apply a safe state when the optimizer cannot run: eco mode, DHW auto.
+
+    Best-effort — never raises. Also used as the daemon's shutdown fallback.
+    """
+    if dry_run:
+        logger.info("Dry-run — skipping safe fallback hardware writes")
+        return
+    logger.info("Applying safe fallback: eco mode, DHW auto")
     try:
-        from .control.inverter import _run_with_retry, _cmds_eco
-        _run_with_retry(config.givenergy, _cmds_eco())
+        from .control.inverter import set_eco_mode
+        set_eco_mode(config.givenergy, config.db_path, skip_if_current=True)
     except Exception as exc:
         logger.error("Safe fallback inverter command failed: %s", exc)
 
-    try:
-        set_dhw(config.melcloud, enabled=False)
-    except Exception as exc:
-        logger.error("Safe fallback DHW command failed: %s", exc)
+    if manage_dhw:
+        try:
+            set_dhw(config.melcloud, enabled=False)
+        except Exception as exc:
+            logger.error("Safe fallback DHW command failed: %s", exc)
 
 
 def _record_actuals(config: AppConfig, now: datetime) -> None:

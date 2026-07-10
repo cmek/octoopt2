@@ -175,6 +175,39 @@ def set_battery_reserve(config: GivEnergyConfig, pct: int) -> None:
     logger.info("Inverter: battery reserve floor set to %d%%", pct)
 
 
+def set_eco_mode(
+    config: GivEnergyConfig,
+    db_path: str,
+    reserve_pct: int | None = None,
+    skip_if_current: bool = False,
+) -> int:
+    """Put the inverter in ECO (dynamic self-consumption). Returns writes sent.
+
+    reserve_pct: when given, both reserve registers (SoC + discharge power) are
+      written to this value in the same one-shot batch as the ECO registers, so
+      the SoC reserve is never transiently set to 4% by the ECO command. Used by
+      octoopt2-away to leave a persistent battery floor.
+    skip_if_current: skip the write when the last-command state already says ECO
+      (only honored when reserve_pct is None, since that state doesn't track the
+      reserve). The state can be stale if the inverter was changed outside
+      octoopt2 — the same assumption apply_decision makes.
+    """
+    if reserve_pct is not None and not 4 <= reserve_pct <= 100:
+        raise ValueError(f"Reserve must be in [4, 100]%, got {reserve_pct}")
+    if skip_if_current and reserve_pct is None:
+        last = _load_last_command(db_path)
+        if last is not None and last.mode == "ECO":
+            logger.info("Inverter already in ECO per last-command state — skipping write")
+            return 0
+    reqs = _cmds_eco(soc_reserve_pct=reserve_pct if reserve_pct is not None else 4)
+    if reserve_pct is not None:
+        reqs += [*commands.set_battery_power_reserve(reserve_pct)]
+    _run_with_retry(config, reqs)
+    total = _save_last_command(db_path, _LastCommand(mode="ECO", power_register=0), len(reqs))
+    logger.info("Inverter: ECO applied — %d register write(s) sent, lifetime total %d", len(reqs), total)
+    return len(reqs)
+
+
 # ── Command builders ──────────────────────────────────────────────────────────
 
 def _cmds_charge(charge_kw: float, limit: int, last_mode: str | None) -> list:
@@ -210,11 +243,11 @@ def _cmds_discharge(discharge_kw: float, limit: int, last_mode: str | None) -> l
     return reqs
 
 
-def _cmds_eco() -> list:
-    logger.info("Inverter → ECO (dynamic mode)")
+def _cmds_eco(soc_reserve_pct: int = 4) -> list:
+    logger.info("Inverter → ECO (dynamic mode), SoC reserve %d%%", soc_reserve_pct)
     return [
         *commands.set_discharge_mode_to_match_demand(),
-        *commands.set_shallow_charge(4),
+        *commands.set_battery_soc_reserve(soc_reserve_pct),
         *commands.disable_discharge(),
     ]
 
