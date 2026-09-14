@@ -36,7 +36,7 @@ Runs every 5 minutes via cron. Each tick it re-optimizes the remaining half-hour
 Every tick refreshes data feeds with TTL-aware caching to avoid unnecessary API calls:
 
 - **Octopus prices** — half-hourly buy/sell rates fetched for today and tomorrow (publishes ~4 PM UK time)
-- **Octopus consumption** — smart meter half-hourly consumption, used to train the load model (1–2 day API lag is normal)
+- **Octopus consumption** — smart meter half-hourly net grid import, kept as meter-side ground truth for reconciliation (1–2 day API lag is normal). Not used by the load model, which fits gross household load from `inverter_readings` — see "Load forecasting" below
 - **Solcast** — solar generation forecast (p10/p50/p90), 2-hour TTL, 10 calls/day limit respected
 - **Open-Meteo** — 15-minute temperature forecast, 1-hour TTL; historical hourly data backfilled for load model training
 - **GivEnergy inverter** — live SoC, solar, grid import/export, battery charge/discharge, home load polled each tick
@@ -145,11 +145,12 @@ All data is stored in a local SQLite database (WAL mode). Tables:
 | Table | Contents |
 |-------|----------|
 | `prices` | Half-hourly Agile buy/sell rates |
-| `consumption` | Octopus smart meter half-hourly consumption |
+| `consumption` | Octopus smart meter half-hourly net grid import |
 | `solar_forecast` | Solcast p10/p50/p90 per slot |
 | `solar_actuals` | Solcast tuned actuals (retrospective) |
 | `weather_forecast` | Open-Meteo 15-min temperature, cloud, wind, humidity, precipitation |
 | `inverter_readings` | Point-in-time inverter snapshots (every 5 min) |
+| `feed_fetches` | Last successful refresh per data feed (backs `octoopt2_feed_age_seconds`) |
 | `schedule` | Latest optimizer plan per slot |
 | `actuals` | Measured outcomes per completed slot (aggregated from inverter readings) |
 
@@ -253,7 +254,31 @@ The daemon serves Prometheus metrics at `http://<host>:9876/metrics` (port set v
 grid import/export, battery charge/discharge), Ecodan tank temperatures and mode
 (`octoopt2_dhw_tank_temp_celsius`, `octoopt2_dhw_mode`), the current slot's planned
 action and cost (`octoopt2_planned_*`, `octoopt2_planned_slot_cost_gbp`), and data-feed
-freshness (`octoopt2_feed_age_seconds`, `octoopt2_last_optimization_age_seconds`).
+freshness (`octoopt2_feed_age_seconds`, `octoopt2_feed_coverage_lag_seconds`,
+`octoopt2_last_optimization_age_seconds`).
+
+Feed freshness is two separate numbers, because they fail independently:
+
+- **`octoopt2_feed_age_seconds{feed=...}`** — seconds since the feed was last
+  successfully refreshed, for every persisted source: `solar`, `weather`,
+  `prices`, `consumption`, `inverter`, `dhw`. A fetch skipped because the data is
+  still inside its TTL counts as a refresh, so every feed is stamped on each
+  ~30-minute slot boundary and one alerting threshold fits all of them. This is
+  the number that says a feed has gone quiet — alert above ~2 h.
+- **`octoopt2_feed_coverage_lag_seconds{feed=...}`** — how far behind the newest
+  data point is. Negative means coverage runs into the future, which is normal
+  for forecasts and published prices. `consumption` sits at 1–2 days in healthy
+  operation because that is how late Octopus publishes smart-meter data; only
+  alert past ~3 days. Not emitted for `inverter`/`dhw`, where the two numbers
+  would be identical.
+
+Keeping these apart matters: before the split, a stalled Octopus fetch and normal
+upstream publication lag produced an identical rising number.
+
+`octoopt2_reading_age_seconds` and `octoopt2_dhw_reading_age_seconds` are a
+different thing again — the daemon's **in-memory** 30 s poll, which never touches
+the database. Use `octoopt2_feed_age_seconds{feed="inverter"}` to check that the
+persisted history the load model is fitted from is still growing.
 
 Example scrape config:
 

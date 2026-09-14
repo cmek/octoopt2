@@ -32,7 +32,7 @@ from .data.inverter import get_latest_reading, read_and_store
 from .data.octopus import fetch_and_store_prices, get_prices_from, missing_price_dates
 from .data.solcast import fetch_and_store_actuals, fetch_and_store_forecast, get_forecast
 from .data.weather import backfill_weather_history, fetch_and_store_weather, get_temperature_forecast
-from .db import get_conn
+from .db import get_conn, record_fetch
 from .optimizer.forecast import fit_load_model, get_temperature_per_slot
 from .optimizer.model import OptimizerInput, optimize
 from .optimizer.schedule import get_current_decision, save_schedule
@@ -43,6 +43,10 @@ LONDON = ZoneInfo("Europe/London")
 
 # Fallback load per slot (kWh) used when the load model has insufficient data.
 _FALLBACK_LOAD_KWH = 0.5
+
+# How far back each consumption refresh reaches. Must exceed the worst-case
+# Octopus publication lag — see _refresh_feeds.
+_CONSUMPTION_WINDOW_DAYS = 4
 
 
 def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, output: bool = False) -> None:
@@ -460,15 +464,24 @@ def _refresh_feeds(config: AppConfig, now: datetime) -> None:
             n = fetch_and_store_prices(config.octopus, config.db_path, for_date=d)
             if n == 0 and d > now.date():
                 logger.info("Tomorrow's prices not published yet")
+        # Stamped for the whole cycle rather than inside fetch_and_store_prices:
+        # prices are fetched only for dates missing from the DB, so on most ticks
+        # there is no call at all. "Refresh completed, nothing outstanding" is the
+        # health signal we want; a raised exception skips the stamp.
+        record_fetch(config.db_path, "prices")
     except Exception as exc:
         logger.warning("Octopus price fetch failed: %s", exc)
 
-    # Octopus consumption — fetch last 2 days to catch API data lag (typically 1-2 days)
+    # Octopus consumption — refetch a rolling window to catch the API's data lag
+    # (typically 1-2 days). The window has to outrun the worst lag, not the
+    # typical one: a slot that falls out of it before Octopus publishes it is
+    # never requested again, leaving a permanent hole. 4 days leaves headroom
+    # for a couple of days of meter comms trouble; upserts make the overlap free.
     try:
-        two_days_ago = (now - timedelta(days=2)).replace(
+        window_start = (now - timedelta(days=_CONSUMPTION_WINDOW_DAYS)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        fetch_and_store_consumption(config.octopus, config.db_path, two_days_ago, now)
+        fetch_and_store_consumption(config.octopus, config.db_path, window_start, now)
     except Exception as exc:
         logger.warning("Octopus consumption fetch failed: %s", exc)
 

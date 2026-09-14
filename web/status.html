@@ -87,6 +87,7 @@ header nav { font-size: 12px; color: var(--muted); display: flex; gap: 10px; }
 .feed .dot { width: 8px; height: 8px; border-radius: 50%; }
 .feed .name { color: var(--muted); text-transform: capitalize; }
 .feed .age { font-weight: 600; font-variant-numeric: tabular-nums; }
+.feed .cov { color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* ── Sparklines ── */
 .sparks { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 16px; }
@@ -390,17 +391,29 @@ function modePill(mode, dhwOn) {
   return `<span class="pill ${cls}">${label}</span>`;
 }
 
-function feedFresh(name, age) {
-  // thresholds (good, warn) in seconds; negative age (future coverage) is good.
-  const T = { solar: [4*3600, 12*3600], weather: [3*3600, 12*3600], prices: [14*3600, 26*3600], consumption: [6*3600, 24*3600] };
-  const [good, warn] = T[name] || [3600, 12*3600];
+// Coverage-lag expectations, in seconds. Separate from the dot colour on
+// purpose: Octopus publishes consumption 1-2 days late, so a big lag there is
+// normal and must not read as a broken feed. null = feed has no slot dimension.
+const COVERAGE_WARN = { consumption: 2.5*86400, prices: -3*3600, solar: 0, weather: 0 };
+
+function feedFresh(name, f) {
+  f = f || {};
+  const age = f.fetch_age_s, lag = f.coverage_lag_s;
+  // Every feed is refreshed on the ~30 min slot boundary, so one threshold pair
+  // fits all of them. This is purely "is the feed still being refreshed".
   let color = 'var(--muted)';
   if (age != null) {
-    if (age <= good) color = 'var(--green)';
-    else if (age <= warn) color = 'var(--amber)';
+    if (age <= 3600) color = 'var(--green)';
+    else if (age <= 3*3600) color = 'var(--amber)';
     else color = 'var(--red)';
   }
-  return `<div class="feed"><span class="dot" style="background:${color}"></span><span class="name">${name}</span><span class="age">${fmtAge(age)}</span></div>`;
+  let cov = '';
+  if (lag != null) {
+    const warn = COVERAGE_WARN[name];
+    const stale = warn != null && lag > warn;
+    cov = `<span class="cov" style="${stale ? 'color:var(--amber)' : ''}" title="newest data point this feed covers">data ${fmtAge(lag)}</span>`;
+  }
+  return `<div class="feed"><span class="dot" style="background:${color}"></span><span class="name">${name}</span><span class="age">${fmtAge(age)}</span>${cov}</div>`;
 }
 
 function render(d) {
@@ -483,7 +496,7 @@ function render(d) {
   // ── Feeds ──
   const feeds = d.feeds || {};
   const feedsHtml = `<section class="card"><div class="card-label" style="margin-bottom:10px">Data feeds</div>
-    <div class="feeds">${['solar','weather','prices','consumption'].map(f => feedFresh(f, feeds[f])).join('')}</div></section>`;
+    <div class="feeds">${['inverter','dhw','solar','weather','prices','consumption'].map(f => feedFresh(f, feeds[f])).join('')}</div></section>`;
 
   // ── Upcoming price strip ──
   const up = (d.upcoming || []).slice(0, 24);

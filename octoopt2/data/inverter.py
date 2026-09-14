@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from ..config import GivEnergyConfig
-from ..db import get_conn
+from ..db import get_conn, record_fetch
 from ..givenergy_modbus_async.client.client import Client
 
 logger = logging.getLogger(__name__)
@@ -112,6 +112,12 @@ def read_and_store(config: GivEnergyConfig, db_path: str) -> InverterReading:
     """Read inverter state and persist it. Returns the reading."""
     reading = read_inverter(config)
     store_reading(reading, db_path)
+    # Stamped here and not in read_inverter(): the daemon's fast poller calls
+    # read_inverter() straight into memory and never writes the DB, so only this
+    # path grows inverter_readings — the history the load model is fitted from.
+    # Watching the in-memory poll alone would hide a scheduler that has been
+    # falling back to stale stored readings (see scheduler._read_inverter).
+    record_fetch(db_path, "inverter")
     logger.info(
         "Inverter: SoC=%.1f%% solar=%.0fW import=%.0fW export=%.0fW "
         "batt_charge=%.0fW batt_discharge=%.0fW load=%.0fW",

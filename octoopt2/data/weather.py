@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 import requests
 
 from ..config import LocationConfig
-from ..db import get_conn
+from ..db import get_conn, record_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ def fetch_and_store_weather(
             staleness,
             WEATHER_TTL_HOURS,
         )
+        record_fetch(db_path, "weather")  # TTL skip = feed is current (see solcast.py)
         return 0
 
     logger.info("Fetching Open-Meteo weather forecast (%d days)", forecast_days)
@@ -126,6 +127,7 @@ def fetch_and_store_weather(
             rows,
         )
 
+    record_fetch(db_path, "weather")
     logger.info("Stored %d weather slots", len(rows))
     return len(rows)
 

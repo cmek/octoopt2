@@ -17,7 +17,7 @@ import pymelcloud
 from pymelcloud import DEVICE_TYPE_ATW
 
 from ..config import MelCloudConfig
-from ..db import get_conn
+from ..db import get_conn, record_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,7 @@ def read_and_store_dhw_state(config: MelCloudConfig, db_path: str) -> dict | Non
                 state.get("status"),
             ),
         )
+    record_fetch(db_path, "dhw")
     return state
 
 
