@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from ..config import OctopusConfig
-from ..db import get_conn
+from ..db import get_conn, record_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,10 @@ def fetch_and_store_consumption(
     )
 
     if not records:
+        # The call succeeded; Octopus simply has nothing new to publish yet.
+        # Stamp it anyway — an empty window is a healthy fetch, and conflating
+        # it with a failed one is exactly what the feed_fetches split avoids.
+        record_fetch(db_path, "consumption")
         logger.info("No consumption data returned for requested window (API lag is normal for recent dates)")
         return 0
 
@@ -91,6 +95,7 @@ def fetch_and_store_consumption(
             rows,
         )
 
+    record_fetch(db_path, "consumption")
     logger.info("Stored %d consumption slots", len(rows))
     return len(rows)
 

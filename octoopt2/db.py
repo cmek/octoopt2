@@ -1,7 +1,11 @@
 """SQLite database setup and schema."""
+import logging
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA = """
@@ -111,7 +115,36 @@ CREATE TABLE IF NOT EXISTS inverter_last_command (
     power_register INTEGER NOT NULL,    -- charge/discharge limit register (1-50); 0 for ECO
     total_writes   INTEGER NOT NULL DEFAULT 0  -- cumulative lifetime register writes sent
 );
+
+-- Last successful fetch/write per data source (one row per feed, upserted on
+-- success). Freshness of a source is *when we last managed to pull it*, which
+-- is distinct from how far behind the data itself runs: Octopus publishes smart
+-- meter consumption 1-2 days late, so a perfectly healthy fetch still yields
+-- day-old slots. Keeping the two apart is what lets a dead fetcher be told from
+-- a lagging upstream. See metrics.py for the gauges built on this.
+CREATE TABLE IF NOT EXISTS feed_fetches (
+    feed        TEXT NOT NULL,   -- see FEEDS below
+    fetched_at  TEXT NOT NULL,   -- ISO8601 UTC of the last successful fetch
+    PRIMARY KEY (feed)
+);
 """
+
+
+# Every persisted data source, in display order. Both the Prometheus collector
+# (metrics.py) and the dashboard status endpoint (status.py) render this list —
+# keep it here so the two cannot drift apart.
+#
+# coverage_table is the table whose slot_start says how far ahead/behind the
+# data itself runs, or None where that is the same thing as the fetch time
+# (inverter and dhw stamp each row with the moment it was read).
+FEEDS: tuple[tuple[str, str | None], ...] = (
+    ("solar", "solar_forecast"),
+    ("weather", "weather_forecast"),
+    ("consumption", "consumption"),
+    ("prices", "prices"),
+    ("inverter", None),
+    ("dhw", None),
+)
 
 
 def init_db(db_path: str) -> None:
@@ -170,3 +203,86 @@ def get_conn(db_path: str):
         raise
     finally:
         conn.close()
+
+
+def record_fetch(db_path: str, feed: str, now: datetime | None = None) -> None:
+    """Stamp a successful fetch of `feed` in feed_fetches.
+
+    Call this only after the fetched data has been written, and never from a
+    failure path: the whole point of the stamp is that it stops advancing when
+    a source goes quiet. Best-effort — a bookkeeping write must not take down
+    the fetch that just succeeded.
+    """
+    ts = (now or datetime.now(timezone.utc)).isoformat()
+    try:
+        with get_conn(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO feed_fetches (feed, fetched_at)
+                VALUES (?, ?)
+                ON CONFLICT(feed) DO UPDATE SET fetched_at = excluded.fetched_at
+                """,
+                (feed, ts),
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not record fetch for feed %s: %s", feed, exc)
+
+
+def age_seconds(iso_ts: str | None, now: datetime) -> float | None:
+    """Seconds between an ISO8601 timestamp and now. None if unparseable/missing.
+
+    Negative when the timestamp is in the future — which is the normal case for
+    the coverage of a forecast feed, so callers must not clamp it.
+    """
+    if not iso_ts:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso_ts)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (now - ts).total_seconds()
+
+
+def feed_freshness(db_path: str, now: datetime) -> dict[str, dict]:
+    """Two independent freshness numbers per feed, keyed by feed name.
+
+    fetch_age_s    — seconds since we last successfully refreshed the source.
+                     Uniform across feeds, so one alerting threshold fits all;
+                     this is the number that says whether a feed has gone quiet.
+    coverage_lag_s — seconds between now and the newest slot the feed covers.
+                     Negative means coverage runs into the future (forecasts,
+                     published prices). Large positive is normal for Octopus
+                     consumption, which lands 1-2 days late. None where the feed
+                     has no slot dimension.
+
+    Either value is None when unknown. Conflating the two is what made a stalled
+    fetcher indistinguishable from an upstream that simply publishes late.
+    """
+    out: dict[str, dict] = {}
+    with get_conn(db_path) as conn:
+        try:
+            stamps = {
+                r["feed"]: r["fetched_at"]
+                for r in conn.execute("SELECT feed, fetched_at FROM feed_fetches")
+            }
+        except sqlite3.Error as exc:  # pragma: no cover - defensive
+            logger.debug("feed_fetches unavailable: %s", exc)
+            stamps = {}
+
+        for feed, coverage_table in FEEDS:
+            coverage = None
+            if coverage_table is not None:
+                try:
+                    row = conn.execute(
+                        f"SELECT MAX(slot_start) AS ts FROM {coverage_table}"  # noqa: S608 - fixed table names from FEEDS
+                    ).fetchone()
+                    coverage = age_seconds(row["ts"] if row else None, now)
+                except sqlite3.Error as exc:  # pragma: no cover - defensive
+                    logger.debug("coverage for feed %s unavailable: %s", feed, exc)
+            out[feed] = {
+                "fetch_age_s": age_seconds(stamps.get(feed), now),
+                "coverage_lag_s": coverage,
+            }
+    return out

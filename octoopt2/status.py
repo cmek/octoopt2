@@ -12,7 +12,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from .db import get_conn
+from .db import age_seconds, feed_freshness, get_conn
 
 logger = logging.getLogger(__name__)
 
@@ -20,19 +20,6 @@ LONDON = ZoneInfo("Europe/London")
 
 # A live inverter reading older than this is treated as "stale" / offline.
 _ONLINE_MAX_AGE_S = 150.0
-
-
-def _age_seconds(iso_ts: str | None, now: datetime) -> float | None:
-    """Seconds between an ISO8601 timestamp and now. None if unparseable/missing."""
-    if not iso_ts:
-        return None
-    try:
-        ts = datetime.fromisoformat(iso_ts)
-    except ValueError:
-        return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return (now - ts).total_seconds()
 
 
 def _slot_mode(charge_kwh: float, discharge_kwh: float, export_kwh: float) -> str:
@@ -135,7 +122,7 @@ def _planner_and_cost(db_path: str, now: datetime) -> tuple[dict, dict, list]:
 
         # Freshness of the most recent optimization.
         opt_row = conn.execute("SELECT MAX(optimized_at) AS ts FROM schedule").fetchone()
-        planner["last_optimization_age_s"] = _age_seconds(
+        planner["last_optimization_age_s"] = age_seconds(
             opt_row["ts"] if opt_row else None, now
         )
 
@@ -191,23 +178,12 @@ def _planner_and_cost(db_path: str, now: datetime) -> tuple[dict, dict, list]:
 
 
 def _feeds(db_path: str, now: datetime) -> dict:
-    """Seconds since each data feed was last refreshed (lower = fresher)."""
-    feeds: dict = {}
-    queries = (
-        ("solar", "SELECT MAX(fetched_at) AS ts FROM solar_forecast"),
-        ("weather", "SELECT MAX(fetched_at) AS ts FROM weather_forecast"),
-        ("consumption", "SELECT MAX(slot_start) AS ts FROM consumption"),
-        ("prices", "SELECT MAX(slot_start) AS ts FROM prices"),
-    )
-    with get_conn(db_path) as conn:
-        for feed, q in queries:
-            try:
-                row = conn.execute(q).fetchone()
-                feeds[feed] = _age_seconds(row["ts"] if row else None, now)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug("feed %s age unavailable: %s", feed, exc)
-                feeds[feed] = None
-    return feeds
+    """Per-feed {fetch_age_s, coverage_lag_s} — see db.feed_freshness."""
+    try:
+        return feed_freshness(db_path, now)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("feed freshness unavailable: %s", exc)
+        return {}
 
 
 def _history(state) -> list:

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 from ..config import SolcastConfig
-from ..db import get_conn
+from ..db import get_conn, record_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,10 @@ def fetch_and_store_forecast(
             staleness,
             FORECAST_TTL_HOURS,
         )
+        # A TTL skip is a healthy outcome: the feed is current, there was just
+        # nothing to do. Stamp it so feed_age tracks "feed is up to date"
+        # uniformly across feeds with very different natural fetch cadences.
+        record_fetch(db_path, "solar")
         return 0
 
     logger.info("Fetching Solcast forecast (%d hours ahead)", hours)
@@ -129,6 +133,7 @@ def fetch_and_store_forecast(
             rows,
         )
 
+    record_fetch(db_path, "solar")
     logger.info("Stored %d forecast slots", len(rows))
     return len(rows)
 

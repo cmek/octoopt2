@@ -19,26 +19,13 @@ from datetime import datetime, timezone
 
 from prometheus_client.core import GaugeMetricFamily
 
-from .db import get_conn
+from .db import age_seconds, feed_freshness, get_conn
 from .optimizer.schedule import get_current_decision
 
 logger = logging.getLogger(__name__)
 
 # DHW operation modes exposed as a labelled enum-style gauge (1 = active mode).
 _DHW_MODES = ("force_hot_water", "auto", "unknown")
-
-
-def _age_seconds(iso_ts: str | None, now: datetime) -> float | None:
-    """Seconds between an ISO8601 timestamp and now. None if unparseable/missing."""
-    if not iso_ts:
-        return None
-    try:
-        ts = datetime.fromisoformat(iso_ts)
-    except ValueError:
-        return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return (now - ts).total_seconds()
 
 
 class OctooptCollector:
@@ -90,7 +77,8 @@ class OctooptCollector:
 
         age = GaugeMetricFamily(
             "octoopt2_reading_age_seconds",
-            "Seconds since the last successful inverter reading",
+            "Seconds since the last successful live inverter poll (in-memory; see "
+            "octoopt2_feed_age_seconds{feed=\"inverter\"} for the persisted history)",
         )
         if reading is not None:
             age.add_metric([], (now - reading.recorded_at).total_seconds())
@@ -128,7 +116,8 @@ class OctooptCollector:
 
         age = GaugeMetricFamily(
             "octoopt2_dhw_reading_age_seconds",
-            "Seconds since the last successful DHW (MELCloud) reading",
+            "Seconds since the last successful live DHW (MELCloud) poll (in-memory; "
+            "see octoopt2_feed_age_seconds{feed=\"dhw\"} for the persisted history)",
         )
         if self._state.latest_dhw_at is not None:
             age.add_metric([], (now - self._state.latest_dhw_at).total_seconds())
@@ -177,28 +166,35 @@ class OctooptCollector:
             "octoopt2_last_optimization_age_seconds",
             "Seconds since the most recent saved schedule was optimized",
         )
+        # Two separate questions, deliberately not merged into one number:
+        # "is this feed still being refreshed" and "how current is the data it
+        # holds". Octopus publishes consumption 1-2 days late, so a healthy feed
+        # legitimately carries a ~35h coverage lag; reporting that as staleness
+        # made a dead fetcher look identical to normal upstream lag.
         feed_age = GaugeMetricFamily(
             "octoopt2_feed_age_seconds",
-            "Seconds since a data feed was last refreshed (lower = fresher)",
+            "Seconds since a data feed was last successfully refreshed "
+            "(a fetch skipped because the data is still within its TTL counts "
+            "as a refresh)",
+            labels=["feed"],
+        )
+        coverage_lag = GaugeMetricFamily(
+            "octoopt2_feed_coverage_lag_seconds",
+            "Seconds between now and the newest slot a feed covers; negative "
+            "means coverage extends into the future",
             labels=["feed"],
         )
         with get_conn(self._db_path) as conn:
             opt_row = conn.execute("SELECT MAX(optimized_at) AS ts FROM schedule").fetchone()
-            opt_seconds = _age_seconds(opt_row["ts"] if opt_row else None, now)
+            opt_seconds = age_seconds(opt_row["ts"] if opt_row else None, now)
             if opt_seconds is not None:
                 opt_age.add_metric([], opt_seconds)
 
-            # Feeds with an explicit fetched_at column: time since last fetch.
-            for feed, query in (
-                ("solar", "SELECT MAX(fetched_at) AS ts FROM solar_forecast"),
-                ("weather", "SELECT MAX(fetched_at) AS ts FROM weather_forecast"),
-                # Consumption/prices have no fetched_at; use the latest slot they cover.
-                ("consumption", "SELECT MAX(slot_start) AS ts FROM consumption"),
-                ("prices", "SELECT MAX(slot_start) AS ts FROM prices"),
-            ):
-                row = conn.execute(query).fetchone()
-                secs = _age_seconds(row["ts"] if row else None, now)
-                if secs is not None:
-                    feed_age.add_metric([feed], secs)
+        for feed, values in feed_freshness(self._db_path, now).items():
+            if values["fetch_age_s"] is not None:
+                feed_age.add_metric([feed], values["fetch_age_s"])
+            if values["coverage_lag_s"] is not None:
+                coverage_lag.add_metric([feed], values["coverage_lag_s"])
         yield opt_age
         yield feed_age
+        yield coverage_lag
