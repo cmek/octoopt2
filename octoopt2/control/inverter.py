@@ -86,42 +86,85 @@ def _save_last_command(db_path: str, cmd: _LastCommand, write_count: int) -> int
     return row["total_writes"] if row else write_count
 
 
+def _log_command(
+    db_path: str,
+    *,
+    mode: str,
+    power_register: int,
+    n_writes: int,
+    ok: bool,
+    error: str | None = None,
+    slot_start: datetime | None = None,
+    trigger: str | None = None,
+) -> None:
+    """Append one row to inverter_commands (audit trail of every write attempt).
+
+    Best-effort: a bookkeeping failure must never mask the outcome of the
+    hardware write itself.
+    """
+    try:
+        with get_conn(db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO inverter_commands
+                    (applied_at, mode, power_register, n_writes, ok, error, slot_start, trigger)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(timezone.utc).isoformat(), mode, power_register, n_writes,
+                    1 if ok else 0, error,
+                    slot_start.astimezone(timezone.utc).isoformat() if slot_start else None,
+                    trigger,
+                ),
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not log inverter command: %s", exc)
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
+
+def decision_to_mode(decision: SlotDecision, battery: BatteryConfig) -> tuple[str, float]:
+    """Map a slot decision to the hardware mode the controller will apply.
+
+    Returns (mode, power_kw) with mode in {"CHARGE", "DISCHARGE_EXPORT", "ECO"}
+    and power_kw the requested charge/discharge rate (0 for ECO). Pure: used by
+    apply_decision and by the backtest replay so both apply identical rules.
+
+    Only force-discharge when the plan is to EXPORT. A discharge-to-meet-load
+    decision is run as dynamic self-consumption (ECO) instead: forcing the
+    discharge slot would drain the battery to the grid whenever real load is
+    below the planned discharge (high PV, or DHW the inverter cannot serve),
+    violating the export=0 intent. Dynamic mode discharges only to meet load.
+    """
+    wants_charge    = decision.battery_charge_kwh    > _THRESHOLD_KWH
+    wants_discharge = decision.battery_discharge_kwh > _THRESHOLD_KWH
+    wants_export    = decision.grid_export_kwh       > _THRESHOLD_KWH
+    if wants_charge:
+        return "CHARGE", decision.battery_charge_kwh / 0.5
+    if wants_discharge and wants_export:
+        return "DISCHARGE_EXPORT", decision.battery_discharge_kwh / 0.5
+    return "ECO", 0.0
+
 
 def apply_decision(
     decision: SlotDecision,
     config: GivEnergyConfig,
     battery: BatteryConfig,
     db_path: str,
+    trigger: str | None = None,
 ) -> None:
     """Translate a slot decision into inverter register writes.
 
     Skips the write entirely if mode and power level are unchanged.
     Only writes slot-time registers when the mode actually changes.
     """
-    wants_charge    = decision.battery_charge_kwh    > _THRESHOLD_KWH
-    wants_discharge = decision.battery_discharge_kwh > _THRESHOLD_KWH
-    wants_export    = decision.grid_export_kwh       > _THRESHOLD_KWH
-
-    # Only force-discharge when the plan is to EXPORT. A discharge-to-meet-load
-    # decision is run as dynamic self-consumption (ECO) instead: forcing the
-    # discharge slot would drain the battery to the grid whenever real load is
-    # below the planned discharge (high PV, or DHW the inverter cannot serve),
-    # violating the export=0 intent. Dynamic mode discharges only to meet load.
-    force_export = wants_discharge and wants_export
-
-    # Determine desired hardware state
-    if wants_charge:
-        charge_kw  = decision.battery_charge_kwh / 0.5
-        power_reg  = _kw_to_register(charge_kw, battery.max_charge_rate_kw)
-        mode       = "CHARGE"
-    elif force_export:
-        discharge_kw = decision.battery_discharge_kwh / 0.5
-        power_reg    = _kw_to_register(discharge_kw, battery.max_discharge_rate_kw)
-        mode         = "DISCHARGE_EXPORT"
+    mode, power_kw = decision_to_mode(decision, battery)
+    if mode == "CHARGE":
+        power_reg = _kw_to_register(power_kw, battery.max_charge_rate_kw)
+    elif mode == "DISCHARGE_EXPORT":
+        power_reg = _kw_to_register(power_kw, battery.max_discharge_rate_kw)
     else:
         power_reg = 0
-        mode      = "ECO"
 
     # ── Skip if unchanged ─────────────────────────────────────────────────
     last = _load_last_command(db_path)
@@ -134,16 +177,23 @@ def apply_decision(
     last_mode = last.mode if last is not None else None
 
     # ── Build command list ────────────────────────────────────────────────
-    if wants_charge:
-        reqs = _cmds_charge(charge_kw, power_reg, last_mode)
-    elif force_export:
-        reqs = _cmds_discharge(discharge_kw, power_reg, last_mode)
+    if mode == "CHARGE":
+        reqs = _cmds_charge(power_kw, power_reg, last_mode)
+    elif mode == "DISCHARGE_EXPORT":
+        reqs = _cmds_discharge(power_kw, power_reg, last_mode)
     else:
-        reqs = _cmds_eco()
+        reqs = _cmds_eco(soc_reserve_pct=battery.hw_reserve_pct)
 
     # ── Send and record ───────────────────────────────────────────────────
-    _run_with_retry(config, reqs)
+    try:
+        _run_with_retry(config, reqs)
+    except Exception as exc:
+        _log_command(db_path, mode=mode, power_register=power_reg, n_writes=len(reqs),
+                     ok=False, error=str(exc), slot_start=decision.slot_start, trigger=trigger)
+        raise
     total = _save_last_command(db_path, _LastCommand(mode=mode, power_register=power_reg), len(reqs))
+    _log_command(db_path, mode=mode, power_register=power_reg, n_writes=len(reqs),
+                 ok=True, slot_start=decision.slot_start, trigger=trigger)
     logger.info(
         "Inverter: %d register write(s) sent — lifetime total %d",
         len(reqs), total,
@@ -200,10 +250,14 @@ def set_eco_mode(
             logger.info("Inverter already in ECO per last-command state — skipping write")
             return 0
     reqs = _cmds_eco(soc_reserve_pct=reserve_pct if reserve_pct is not None else 4)
-    if reserve_pct is not None:
-        reqs += [*commands.set_battery_power_reserve(reserve_pct)]
-    _run_with_retry(config, reqs)
+    try:
+        _run_with_retry(config, reqs)
+    except Exception as exc:
+        _log_command(db_path, mode="ECO", power_register=0, n_writes=len(reqs),
+                     ok=False, error=str(exc), trigger="fallback")
+        raise
     total = _save_last_command(db_path, _LastCommand(mode="ECO", power_register=0), len(reqs))
+    _log_command(db_path, mode="ECO", power_register=0, n_writes=len(reqs), ok=True, trigger="fallback")
     logger.info("Inverter: ECO applied — %d register write(s) sent, lifetime total %d", len(reqs), total)
     return len(reqs)
 
@@ -244,11 +298,26 @@ def _cmds_discharge(discharge_kw: float, limit: int, last_mode: str | None) -> l
 
 
 def _cmds_eco(soc_reserve_pct: int = 4) -> list:
+    """Build ECO (dynamic self-consumption) commands.
+
+    Both schedules are disabled. Disabling the *charge* schedule is essential:
+    _cmds_charge arms a 00:00–23:59 charge window, and while that window is
+    active the inverter neither discharges to meet load nor stops pulling from
+    the grid — so an ECO that left it armed would import every kWh the house
+    used until the next forced-export slot cleared it. (Measured Sep–Oct 2026:
+    battery served <1% of load in ECO slots following a CHARGE slot.)
+
+    Both reserve registers are written so the hardware floor tracks the
+    configured planning floor instead of silently reverting to GivEnergy's 4%
+    (SoC reserve) or keeping a stale discharge-power reserve.
+    """
     logger.info("Inverter → ECO (dynamic mode), SoC reserve %d%%", soc_reserve_pct)
     return [
         *commands.set_discharge_mode_to_match_demand(),
         *commands.set_battery_soc_reserve(soc_reserve_pct),
+        *commands.set_battery_power_reserve(soc_reserve_pct),
         *commands.disable_discharge(),
+        *commands.disable_charge(),
     ]
 
 

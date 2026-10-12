@@ -13,9 +13,15 @@ def save_schedule(
     inputs: OptimizerInput,
     db_path: str,
 ) -> None:
-    """Upsert all slot decisions into the schedule table."""
+    """Upsert all slot decisions into the schedule table.
+
+    Also appends every decision to schedule_history (keyed by slot and
+    optimized_at) in the same transaction, so superseded plans survive the
+    upsert. `schedule` stays the latest-plan view.
+    """
     optimized_at = result.optimized_at.isoformat()
     rows = []
+    history_rows = []
     for t, decision in enumerate(result.decisions):
         rows.append((
             decision.slot_start.astimezone(timezone.utc).isoformat(),
@@ -29,6 +35,24 @@ def save_schedule(
             inputs.buy_prices[t],
             inputs.sell_prices[t],
             optimized_at,
+        ))
+        history_rows.append((
+            rows[-1][0],
+            optimized_at,
+            decision.battery_charge_kwh,
+            decision.battery_discharge_kwh,
+            decision.grid_import_kwh,
+            decision.grid_export_kwh,
+            int(decision.dhw_on),
+            inputs.load_forecast[t],
+            inputs.solar_forecast[t],
+            inputs.buy_prices[t],
+            inputs.sell_prices[t],
+            decision.soc_start_kwh,
+            decision.soc_end_kwh,
+            # getattr: older SlotDecision objects (e.g. built from DB rows) may
+            # predate the curtailed_kwh field.
+            getattr(decision, "curtailed_kwh", None),
         ))
 
     with get_conn(db_path) as conn:
@@ -54,12 +78,59 @@ def save_schedule(
             """,
             rows,
         )
+        # Append-only: a re-run with the same optimized_at is a no-op.
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO schedule_history (
+                slot_start, optimized_at, battery_charge_kwh, battery_discharge_kwh,
+                grid_import_kwh, grid_export_kwh, dhw_on,
+                predicted_load_kwh, predicted_solar_kwh, buy_gbp_kwh, sell_gbp_kwh,
+                soc_start_kwh, soc_end_kwh, curtailed_kwh
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            history_rows,
+        )
     logger.info(
         "Saved %d slot decisions (cost=£%.4f, status=%s)",
         len(rows),
         result.total_cost_gbp,
         result.solver_status,
     )
+
+
+# Columns of optimizer_runs other than the key; **fields not in this set are
+# rejected so a typo cannot silently drop data.
+_RUN_FIELDS = (
+    "status", "objective_gbp", "grid_cost_gbp", "solve_seconds",
+    "horizon_slots", "horizon_start", "soc_start_kwh",
+    "alpha", "beta", "ref_temp", "n_train_slots", "manage_dhw", "error",
+)
+
+
+def record_optimizer_run(db_path: str, run_at: datetime | None = None, **fields) -> None:
+    """Insert one row into optimizer_runs. Unspecified fields are NULL.
+
+    `run_at` defaults to now (UTC). Keys must be optimizer_runs columns —
+    see _RUN_FIELDS. Booleans are stored as 0/1.
+    """
+    unknown = set(fields) - set(_RUN_FIELDS)
+    if unknown:
+        raise ValueError(f"Unknown optimizer_runs fields: {sorted(unknown)}")
+    ts = (run_at or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    values = []
+    for name in _RUN_FIELDS:
+        v = fields.get(name)
+        if isinstance(v, bool):
+            v = int(v)
+        values.append(v)
+    with get_conn(db_path) as conn:
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO optimizer_runs (run_at, {", ".join(_RUN_FIELDS)})
+            VALUES (?, {", ".join("?" for _ in _RUN_FIELDS)})
+            """,  # noqa: S608 - column names are a fixed module constant
+            (ts, *values),
+        )
 
 
 def get_current_decision(db_path: str, now: datetime | None = None) -> SlotDecision | None:

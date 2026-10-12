@@ -27,6 +27,7 @@ octoopt2-report = "scripts.report:main"
 octoopt2-accuracy-report = "scripts.accuracy_report:main"
 octoopt2-set-reserve = "scripts.set_reserve:main"
 octoopt2-away = "scripts.away:main"
+octoopt2-backtest = "scripts.backtest:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -38,3 +39,6 @@ dev-dependencies = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

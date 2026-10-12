@@ -12,19 +12,26 @@ Decision variables:
   is_charging[t]    battery direction flag (binary, prevents simultaneous charge+discharge)
   is_importing[t]   grid direction flag    (binary, prevents simultaneous import+export)
 
+  curtail[t]        kWh of solar not used   (continuous, ≥ 0; what the inverter
+                                            clips when the battery is full and
+                                            export is capped)
+
 AC power balance (per slot):
-  solar[t] + grid_import[t] + bat_discharge[t]
+  solar[t] - curtail[t] + grid_import[t] + bat_discharge[t]
       = load[t] + dhw_on[t]*dhw_kwh_per_slot + grid_export[t] + bat_charge[t]
 
 SoC update:
   soc[t+1] = soc[t] + bat_charge[t]*charge_eff - bat_discharge[t]/discharge_eff
 
 Objective:
-  minimise Σ_t ( buy_price[t]*grid_import[t] - sell_price[t]*grid_export[t] )
+  minimise Σ_t ( buy_price[t]*grid_import[t] - sell_price[t]*grid_export[t]
+                 + cycle_cost*(bat_charge[t] + bat_discharge[t]) )
+           - terminal_value * soc[n]
 """
 import logging
+import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pulp
@@ -64,15 +71,18 @@ class SlotDecision:
     dhw_on: bool
     soc_start_kwh: float   # SoC at start of this slot
     soc_end_kwh: float     # SoC at end of this slot
-    slot_cost_gbp: float   # negative = net revenue
+    slot_cost_gbp: float   # negative = net revenue (grid cost only, no virtual terms)
+    curtailed_kwh: float = 0.0  # solar the plan expects to clip this slot
 
 
 @dataclass
 class OptimizerResult:
     decisions: list[SlotDecision]
-    total_cost_gbp: float
+    total_cost_gbp: float      # objective value: grid cost + virtual cycle cost - terminal value
     solver_status: str
     optimized_at: datetime
+    solve_seconds: float = 0.0
+    grid_cost_gbp: float = 0.0  # Σ slot_cost_gbp — the money part only
 
 
 def optimize(
@@ -82,11 +92,26 @@ def optimize(
     givenergy: GivEnergyConfig,
     manage_dhw: bool = True,
     dhw_kwh_per_slot: float | None = None,
+    *,
+    time_limit_s: int = 30,
+    allow_curtailment: bool = True,
+    terminal_soc_value_gbp_kwh: float | None = None,
+    min_terminal_soc_kwh: float | None = None,
 ) -> OptimizerResult:
     """Run the MILP optimizer and return a schedule.
 
     If the solver cannot find an optimal solution it falls back to a feasible
     solution, or raises RuntimeError if the problem is infeasible.
+
+    allow_curtailment: let the plan clip solar when the battery is full and the
+        export cap binds (what the inverter physically does). Without it the
+        balance is a strict equality and a sunny day with a full battery is
+        infeasible.
+    terminal_soc_value_gbp_kwh: credit per kWh left in the battery at the end of
+        the horizon. None → battery.terminal_value_gbp_kwh, which itself defaults
+        to the horizon's mean buy price × discharge efficiency. Pass 0 for the
+        legacy "drain to the floor at the horizon end" behaviour.
+    min_terminal_soc_kwh: hard lower bound on the final SoC (backtest use).
 
     dhw_kwh_per_slot: energy added to the load balance for each slot DHW is
         enabled. Pass the load model's fitted β (the empirically-observed
@@ -106,6 +131,13 @@ def optimize(
     max_import_kwh = givenergy.max_import_kw * SLOT_HOURS
     max_export_kwh = givenergy.max_export_kw * SLOT_HOURS
 
+    if terminal_soc_value_gbp_kwh is None:
+        terminal_soc_value_gbp_kwh = battery.terminal_value_gbp_kwh
+    if terminal_soc_value_gbp_kwh is None:
+        positive = [p for p in inputs.buy_prices if p > 0]
+        mean_buy = sum(positive) / len(positive) if positive else 0.0
+        terminal_soc_value_gbp_kwh = mean_buy * battery.discharge_efficiency
+
     prob = pulp.LpProblem("energy_cost", pulp.LpMinimize)
 
     # ── Continuous variables ──────────────────────────────────────────────
@@ -123,6 +155,13 @@ def optimize(
     ]
     bat_discharge = [
         pulp.LpVariable(f"bd_{t}", lowBound=0, upBound=max_discharge_kwh)
+        for t in range(n)
+    ]
+    curtail = [
+        pulp.LpVariable(
+            f"cu_{t}", lowBound=0,
+            upBound=max(0.0, inputs.solar_forecast[t]) if allow_curtailment else 0,
+        )
         for t in range(n)
     ]
     # soc[0] = initial (measured reality — no floor constraint, it may already be below min)
@@ -157,15 +196,24 @@ def optimize(
     # before cycling the battery, filtering out thin-margin cycles driven by
     # forecast noise. It is not a real cost — it is never paid — but it shifts
     # the break-even spread by roughly 2× cycle_cost (≈3p with the default 1.5p).
-    prob += pulp.lpSum(
-        inputs.buy_prices[t] * grid_import[t]
-        - inputs.sell_prices[t] * grid_export[t]
-        + battery.cycle_cost_gbp_kwh * (bat_charge[t] + bat_discharge[t])
-        for t in range(n)
+    # Energy left in the battery at the horizon end is credited at
+    # terminal_soc_value so the plan does not drain to the floor merely because
+    # the horizon (which can be as short as a few hours before tomorrow's
+    # prices are published) ends.
+    prob += (
+        pulp.lpSum(
+            inputs.buy_prices[t] * grid_import[t]
+            - inputs.sell_prices[t] * grid_export[t]
+            + battery.cycle_cost_gbp_kwh * (bat_charge[t] + bat_discharge[t])
+            for t in range(n)
+        )
+        - terminal_soc_value_gbp_kwh * soc[n]
     )
 
     # ── Initial SoC ───────────────────────────────────────────────────────
     prob += soc[0] == inputs.initial_soc_kwh
+    if min_terminal_soc_kwh is not None:
+        prob += soc[n] >= min_terminal_soc_kwh
 
     for t in range(n):
         load_t = inputs.load_forecast[t]
@@ -173,7 +221,7 @@ def optimize(
 
         # ── AC power balance ──────────────────────────────────────────────
         prob += (
-            solar_t + grid_import[t] + bat_discharge[t]
+            solar_t - curtail[t] + grid_import[t] + bat_discharge[t]
             == load_t + dhw_on[t] * dhw_kwh_per_slot + grid_export[t] + bat_charge[t]
         )
 
@@ -222,8 +270,10 @@ def optimize(
             prob += dhw_on[t] == 0
 
     # ── Solve ─────────────────────────────────────────────────────────────
-    solver = pulp.getSolver("PULP_CBC_CMD", msg=False, timeLimit=30)
+    solver = pulp.getSolver("PULP_CBC_CMD", msg=False, timeLimit=time_limit_s)
+    t0 = time.perf_counter()
     prob.solve(solver)
+    solve_seconds = time.perf_counter() - t0
 
     status = pulp.LpStatus[prob.status]
     # Accept a proven optimum, or a feasible incumbent found before the time
@@ -240,10 +290,11 @@ def optimize(
         raise RuntimeError(f"Optimizer found no usable solution: {status}")
 
     logger.info(
-        "Optimizer: status=%s cost=£%.4f slots=%d",
+        "Optimizer: status=%s objective=£%.4f slots=%d solve=%.2fs",
         status,
         pulp.value(prob.objective) or 0.0,
         n,
+        solve_seconds,
     )
 
     # ── Extract decisions ─────────────────────────────────────────────────
@@ -266,6 +317,7 @@ def optimize(
             soc_start_kwh=soc_start,
             soc_end_kwh=soc_end,
             slot_cost_gbp=inputs.buy_prices[t] * gi - inputs.sell_prices[t] * ge,
+            curtailed_kwh=_val(curtail[t]),
         ))
 
     return OptimizerResult(
@@ -273,6 +325,8 @@ def optimize(
         total_cost_gbp=pulp.value(prob.objective) or 0.0,
         solver_status=status,
         optimized_at=datetime.now(timezone.utc),
+        solve_seconds=solve_seconds,
+        grid_cost_gbp=sum(d.slot_cost_gbp for d in decisions),
     )
 
 

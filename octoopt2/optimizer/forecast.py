@@ -30,7 +30,6 @@ because the tank is often already at target when DHW is commanded).
 The model is cheap to fit (~tens of ms) so it is re-fitted on every optimizer run.
 """
 import logging
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -51,6 +50,12 @@ UK_HOLIDAYS = holidays.country_holidays("GB", subdiv="ENG")
 # Minimum historical slots needed before the model is considered reliable.
 # 48 slots/day × 7 days = one week minimum.
 MIN_SLOTS = 48 * 7
+
+# How far back the fit looks (days). The daemon now persists a reading every
+# 30 s, so an unbounded scan of inverter_readings grows without limit; eight
+# weeks is enough to cover every (day_type, slot) group many times over while
+# keeping the baseline responsive to seasonal change.
+TRAINING_DAYS = 56
 
 # Floor applied to every slot prediction — represents the always-on base load
 # (router, standby devices, fridge, etc.).  300 W × 0.5 h = 0.150 kWh.
@@ -268,26 +273,41 @@ def _nearest_temperature(
     return None
 
 
-def _load_gross_load(db_path: str) -> dict[datetime, float]:
+def _load_gross_load(db_path: str, now: datetime | None = None) -> dict[datetime, float]:
     """Aggregate inverter_readings.load_w into gross load (kWh) per 30-min slot.
 
     load_w is p_load_demand — gross household consumption behind the grid CT,
-    including the Ecodan DHW load. Readings arrive every ~5 min (irregular), so
-    each slot's mean power is converted to energy: mean_W / 1000 * 0.5 h.
+    including the Ecodan DHW load. Readings are irregular (5 min from the cron
+    path, 30 s from the daemon poller), so each slot's mean power is converted
+    to energy: mean_W / 1000 * 0.5 h.
+
+    Bucketing is done in SQL — recorded_at is always UTC ISO
+    "YYYY-MM-DDTHH:MM:SS.ffffff+00:00", so the first 14 chars are the hour
+    prefix and chars 15-16 the minute — and bounded to the last TRAINING_DAYS,
+    so the query returns one row per slot instead of every reading.
     """
-    buckets: dict[datetime, list[float]] = defaultdict(list)
+    now = now or datetime.now(timezone.utc)
+    since = (now - timedelta(days=TRAINING_DAYS)).astimezone(timezone.utc)
     with get_conn(db_path) as conn:
         rows = conn.execute(
-            "SELECT recorded_at, load_w FROM inverter_readings"
+            """
+            SELECT substr(recorded_at, 1, 14)
+                   || CASE WHEN CAST(substr(recorded_at, 15, 2) AS INTEGER) < 30
+                           THEN '00' ELSE '30' END AS bucket,
+                   AVG(load_w) AS load_w,
+                   COUNT(*)    AS n
+            FROM inverter_readings
+            WHERE recorded_at >= ?
+            GROUP BY bucket
+            ORDER BY bucket
+            """,
+            (since.isoformat(),),
         ).fetchall()
-    for r in rows:
-        dt = datetime.fromisoformat(r["recorded_at"]).astimezone(timezone.utc)
-        slot = dt.replace(minute=(dt.minute // 30) * 30, second=0, microsecond=0)
-        buckets[slot].append(r["load_w"])
     return {
-        slot: float(np.mean(ws)) / 1000.0 * _SLOT_HOURS
-        for slot, ws in buckets.items()
-        if ws
+        datetime.fromisoformat(r["bucket"]).replace(tzinfo=timezone.utc):
+            float(r["load_w"]) / 1000.0 * _SLOT_HOURS
+        for r in rows
+        if r["n"]
     }
 
 
@@ -309,16 +329,35 @@ def _load_dhw_schedule(db_path: str) -> dict[datetime, int]:
 
 
 def _load_weather(db_path: str) -> dict[datetime, float]:
-    """Load all weather temperature records as slot_start → temperature_c."""
+    """Load temperature history as slot_start → temperature_c for training.
+
+    Observed (archive) readings in weather_observed win where present; slots
+    without one fall back to whatever forecast was last stored in
+    weather_forecast. The ±30 min nearest-match in _nearest_temperature then
+    bridges the hourly/15-min resolution gap as before.
+    """
     with get_conn(db_path) as conn:
-        rows = conn.execute(
+        forecast = conn.execute(
             """
             SELECT slot_start, temperature_c FROM weather_forecast
             WHERE temperature_c IS NOT NULL
             ORDER BY slot_start
             """
         ).fetchall()
-    return {
+        observed = conn.execute(
+            """
+            SELECT slot_start, temperature_c FROM weather_observed
+            WHERE temperature_c IS NOT NULL
+            ORDER BY slot_start
+            """
+        ).fetchall()
+    out = {
         datetime.fromisoformat(r["slot_start"]): r["temperature_c"]
-        for r in rows
+        for r in forecast
     }
+    # Observed overrides forecast on the same timestamp.
+    out.update(
+        (datetime.fromisoformat(r["slot_start"]), r["temperature_c"])
+        for r in observed
+    )
+    return out

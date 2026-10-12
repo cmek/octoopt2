@@ -122,10 +122,114 @@ CREATE TABLE IF NOT EXISTS inverter_last_command (
 -- meter consumption 1-2 days late, so a perfectly healthy fetch still yields
 -- day-old slots. Keeping the two apart is what lets a dead fetcher be told from
 -- a lagging upstream. See metrics.py for the gauges built on this.
+-- Audit trail of every inverter register-write attempt (success or failure).
+-- inverter_last_command only keeps the latest state; this table lets the
+-- backtest attribute plan-vs-actual gaps to what was actually commanded.
+CREATE TABLE IF NOT EXISTS inverter_commands (
+    applied_at     TEXT NOT NULL PRIMARY KEY,
+    mode           TEXT NOT NULL,       -- CHARGE | DISCHARGE_EXPORT | ECO
+    power_register INTEGER NOT NULL,
+    n_writes       INTEGER NOT NULL,
+    ok             INTEGER NOT NULL,    -- 1 = all writes acknowledged
+    error          TEXT,
+    slot_start     TEXT,                -- slot the decision was for (NULL for fallback/away)
+    trigger        TEXT                 -- fast | slow | fallback | away
+);
+
 CREATE TABLE IF NOT EXISTS feed_fetches (
     feed        TEXT NOT NULL,   -- see FEEDS below
     fetched_at  TEXT NOT NULL,   -- ISO8601 UTC of the last successful fetch
     PRIMARY KEY (feed)
+);
+
+-- Every schedule the optimizer ever produced, one row per (slot, run). The
+-- `schedule` table above is only the *latest* plan per slot; this keeps the
+-- superseded ones so plan-vs-plan drift and plan-vs-actual gaps can be studied
+-- after the fact. Written in the same transaction as `schedule`.
+CREATE TABLE IF NOT EXISTS schedule_history (
+    slot_start            TEXT NOT NULL,
+    optimized_at          TEXT NOT NULL,
+    battery_charge_kwh    REAL NOT NULL,
+    battery_discharge_kwh REAL NOT NULL,
+    grid_import_kwh       REAL NOT NULL,
+    grid_export_kwh       REAL NOT NULL,
+    dhw_on                INTEGER NOT NULL,
+    predicted_load_kwh    REAL NOT NULL,
+    predicted_solar_kwh   REAL NOT NULL,
+    buy_gbp_kwh           REAL NOT NULL,
+    sell_gbp_kwh          REAL NOT NULL,
+    soc_start_kwh         REAL,
+    soc_end_kwh           REAL,
+    curtailed_kwh         REAL,
+    PRIMARY KEY (slot_start, optimized_at)
+);
+
+-- One row per optimizer invocation (success, error or fallback), with the
+-- solver outcome and the load-model fit it ran against. Lets the solver's
+-- health and the model's drift be charted without grepping logs.
+CREATE TABLE IF NOT EXISTS optimizer_runs (
+    run_at         TEXT NOT NULL PRIMARY KEY,
+    status         TEXT,       -- solver status (Optimal, ...) | error | fallback
+    objective_gbp  REAL,       -- full objective incl. virtual terms
+    grid_cost_gbp  REAL,       -- money-only part of the objective
+    solve_seconds  REAL,
+    horizon_slots  INTEGER,
+    horizon_start  TEXT,
+    soc_start_kwh  REAL,
+    alpha          REAL,       -- load model temperature coefficient (kWh/°C)
+    beta           REAL,       -- load model DHW coefficient (kWh/slot)
+    ref_temp       REAL,       -- load model reference temperature (°C)
+    n_train_slots  INTEGER,    -- slots the load model was fitted on
+    manage_dhw     INTEGER,
+    error          TEXT        -- exception text / fallback reason
+);
+
+-- Every Solcast forecast ever fetched, keyed by (slot, fetch time). The
+-- solar_forecast table keeps only the newest value per slot; this one lets
+-- forecast skill be measured as a function of lead time.
+CREATE TABLE IF NOT EXISTS solar_forecast_history (
+    slot_start       TEXT NOT NULL,
+    fetched_at       TEXT NOT NULL,
+    pv_estimate_kwh  REAL NOT NULL,
+    pv_estimate_p10  REAL,
+    pv_estimate_p90  REAL,
+    PRIMARY KEY (slot_start, fetched_at)
+);
+
+-- Same idea for Open-Meteo: every forecast fetched, by lead time.
+CREATE TABLE IF NOT EXISTS weather_forecast_history (
+    slot_start          TEXT NOT NULL,
+    fetched_at          TEXT NOT NULL,
+    temperature_c       REAL,
+    cloud_cover_pct     REAL,
+    wind_speed_ms       REAL,
+    humidity_pct        REAL,
+    precipitation_mm    REAL,
+    PRIMARY KEY (slot_start, fetched_at)
+);
+
+-- Observed (archive/reanalysis) weather, hourly, from the Open-Meteo archive
+-- backfill. Kept apart from weather_forecast so the load model can train on
+-- what actually happened rather than on whatever forecast was last stored.
+CREATE TABLE IF NOT EXISTS weather_observed (
+    slot_start          TEXT NOT NULL PRIMARY KEY,
+    temperature_c       REAL,
+    cloud_cover_pct     REAL,
+    wind_speed_ms       REAL,
+    humidity_pct        REAL,
+    precipitation_mm    REAL,
+    fetched_at          TEXT NOT NULL
+);
+
+-- Daily standing charge for the import tariff (pence/day inc. VAT), one row
+-- per published validity period. Needed to turn per-kWh costs into a bill.
+CREATE TABLE IF NOT EXISTS standing_charges (
+    tariff_code          TEXT NOT NULL,
+    valid_from           TEXT NOT NULL,
+    valid_to             TEXT,            -- NULL = open-ended
+    value_inc_vat_p_day  REAL NOT NULL,
+    fetched_at           TEXT NOT NULL,
+    PRIMARY KEY (tariff_code, valid_from)
 );
 """
 
@@ -144,6 +248,7 @@ FEEDS: tuple[tuple[str, str | None], ...] = (
     ("prices", "prices"),
     ("inverter", None),
     ("dhw", None),
+    ("standing", None),   # import-tariff standing charge (daily TTL)
 )
 
 
@@ -187,6 +292,57 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ALTER TABLE prices_new RENAME TO prices;
             """
         )
+
+    # Nullable columns added later. Each ALTER is idempotent via try/except
+    # ("duplicate column name"), so init_db can be re-run freely.
+    for table, column, decl in _ADDED_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")  # noqa: S608 - fixed names
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+
+# (table, column, type) for every nullable column bolted on after the initial
+# CREATE TABLE. All optional: readers must tolerate NULL in older rows.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    # inverter_readings — extra registers captured alongside the power flows
+    ("inverter_readings", "temp_battery_c", "REAL"),
+    ("inverter_readings", "v_battery", "REAL"),
+    ("inverter_readings", "i_battery", "REAL"),
+    ("inverter_readings", "e_pv_total", "REAL"),                 # lifetime kWh counters
+    ("inverter_readings", "e_grid_in_total", "REAL"),
+    ("inverter_readings", "e_grid_out_total", "REAL"),
+    ("inverter_readings", "e_battery_charge_total", "REAL"),
+    ("inverter_readings", "e_battery_discharge_total", "REAL"),
+    ("inverter_readings", "e_inverter_in_total", "REAL"),
+    ("inverter_readings", "e_inverter_out_total", "REAL"),
+    ("inverter_readings", "num_cycles", "INTEGER"),              # battery 0 cycle count
+    ("inverter_readings", "hr_enable_charge", "INTEGER"),        # holding registers as read
+    ("inverter_readings", "hr_enable_discharge", "INTEGER"),
+    ("inverter_readings", "hr_soc_reserve", "INTEGER"),
+    ("inverter_readings", "hr_power_reserve", "INTEGER"),
+    ("inverter_readings", "hr_charge_limit", "INTEGER"),
+    ("inverter_readings", "hr_discharge_limit", "INTEGER"),
+    ("inverter_readings", "hr_eco_mode", "INTEGER"),
+    # actuals — battery flows and SoC endpoints per slot
+    ("actuals", "battery_charge_kwh", "REAL"),
+    ("actuals", "battery_discharge_kwh", "REAL"),
+    ("actuals", "soc_start_pct", "REAL"),
+    ("actuals", "soc_end_pct", "REAL"),
+    ("actuals", "n_samples", "INTEGER"),   # readings aggregated; NULL = pre-upgrade row
+    ("actuals", "curtailed_kwh", "REAL"),
+    # dhw_readings — wider Ecodan snapshot
+    ("dhw_readings", "outside_temperature_c", "REAL"),
+    ("dhw_readings", "flow_temperature_c", "REAL"),
+    ("dhw_readings", "return_temperature_c", "REAL"),
+    ("dhw_readings", "target_flow_temperature_c", "REAL"),
+    ("dhw_readings", "room_temperature_c", "REAL"),
+    ("dhw_readings", "room_target_c", "REAL"),
+    ("dhw_readings", "power", "INTEGER"),
+    # prices — ex-VAT rates alongside the inc-VAT ones
+    ("prices", "buy_exc_vat_gbp_kwh", "REAL"),
+    ("prices", "sell_exc_vat_gbp_kwh", "REAL"),
+)
 
 
 @contextmanager

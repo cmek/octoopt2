@@ -132,6 +132,16 @@ def fetch_and_store_forecast(
             """,
             rows,
         )
+        # Append-only copy keyed by fetch time, so every forecast revision is
+        # kept (the upsert above only retains the newest one per slot).
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO solar_forecast_history
+                (slot_start, fetched_at, pv_estimate_kwh, pv_estimate_p10, pv_estimate_p90)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [(r[0], r[4], r[1], r[2], r[3]) for r in rows],
+        )
 
     record_fetch(db_path, "solar")
     logger.info("Stored %d forecast slots", len(rows))

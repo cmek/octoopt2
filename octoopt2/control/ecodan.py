@@ -51,24 +51,44 @@ def read_and_store_dhw_state(config: MelCloudConfig, db_path: str) -> dict | Non
     except Exception as exc:
         logger.warning("Failed to read DHW state for logging: %s", exc)
         return None
+    store_dhw_state(state, db_path)
+    return state
+
+
+def store_dhw_state(state: dict, db_path: str, recorded_at: datetime | None = None) -> None:
+    """Persist one DHW state dict (as returned by get_dhw_state) to dhw_readings.
+
+    Used by both the scheduler's slot-boundary read and the daemon's 5-min
+    poll. Missing keys are stored as NULL; stamps the "dhw" feed.
+    """
+    ts = (recorded_at or datetime.now(timezone.utc)).isoformat()
+    power = state.get("power")
     with get_conn(db_path) as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO dhw_readings
                 (recorded_at, operation_mode, tank_temperature_c,
-                 target_tank_temperature_c, status)
-            VALUES (?, ?, ?, ?, ?)
+                 target_tank_temperature_c, status,
+                 outside_temperature_c, flow_temperature_c, return_temperature_c,
+                 target_flow_temperature_c, room_temperature_c, room_target_c, power)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                datetime.now(timezone.utc).isoformat(),
+                ts,
                 state.get("operation_mode"),
                 state.get("tank_temperature"),
                 state.get("target_tank_temperature"),
                 state.get("status"),
+                state.get("outside_temperature"),
+                state.get("flow_temperature"),
+                state.get("return_temperature"),
+                state.get("target_flow_temperature"),
+                state.get("room_temperature"),
+                state.get("room_target"),
+                None if power is None else int(bool(power)),
             ),
         )
     record_fetch(db_path, "dhw")
-    return state
 
 
 # ── Async internals ────────────────────────────────────────────────────────
@@ -113,13 +133,36 @@ async def _set_dhw_async(config: MelCloudConfig, enabled: bool) -> None:
         await device.set({"operation_mode": mode})
 
 
+def _opt(obj, name: str):
+    """getattr(obj, name) or None — pymelcloud properties raise KeyError when
+    MELCloud omits a field (e.g. zone flow temperature outside a full poll),
+    and a missing optional must never fail the read."""
+    try:
+        return getattr(obj, name, None)
+    except Exception:
+        return None
+
+
 async def _get_dhw_state_async(config: MelCloudConfig) -> dict:
     async with aiohttp.ClientSession() as session:
         device = await _get_device(config, session)
         await device.update()
+        # Flow/return/target-flow and room temperatures live on the zone
+        # objects (pymelcloud.atw_device.Zone); zones without a thermostat are
+        # not listed, so zone 1 may be absent.
+        zones = _opt(device, "zones") or []
+        zone = zones[0] if zones else None
         return {
             "operation_mode": device.operation_mode,
             "tank_temperature": device.tank_temperature,
             "target_tank_temperature": device.target_tank_temperature,
             "status": device.status,
+            # Optional extras (None when unavailable) — see store_dhw_state.
+            "outside_temperature": _opt(device, "outside_temperature"),
+            "flow_temperature": _opt(zone, "flow_temperature") if zone else None,
+            "return_temperature": _opt(zone, "return_temperature") if zone else None,
+            "target_flow_temperature": _opt(zone, "target_flow_temperature") if zone else None,
+            "room_temperature": _opt(zone, "room_temperature") if zone else None,
+            "room_target": _opt(zone, "target_temperature") if zone else None,
+            "power": _opt(device, "power"),
         }
