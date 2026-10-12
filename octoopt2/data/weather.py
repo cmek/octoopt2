@@ -126,10 +126,26 @@ def fetch_and_store_weather(
             """,
             rows,
         )
+        # Append-only copy keyed by fetch time — every forecast revision kept.
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO weather_forecast_history
+                (slot_start, fetched_at, temperature_c, cloud_cover_pct,
+                 wind_speed_ms, humidity_pct, precipitation_mm)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [(r[0], r[6], r[1], r[2], r[3], r[4], r[5]) for r in rows],
+        )
 
     record_fetch(db_path, "weather")
     logger.info("Stored %d weather slots", len(rows))
     return len(rows)
+
+
+# Re-query the archive at most this often while the newest day is still
+# missing (the archive lags ~1 day, occasionally more). No API key / hard
+# limit, but one call per slot boundary would be needlessly rude.
+_ARCHIVE_RETRY_HOURS = 6
 
 
 def backfill_weather_history(
@@ -139,30 +155,34 @@ def backfill_weather_history(
 ) -> int:
     """Fetch hourly historical weather from the Open-Meteo archive API.
 
-    Fills the weather_forecast table with past temperature data so the load
-    model can be trained against historical consumption. Only fetches slots
-    not already present in the DB.
+    Writes the observed values to weather_observed (INSERT OR REPLACE — the
+    archive is the authority on what happened) and, as before, fills gaps in
+    weather_forecast (INSERT ... DO NOTHING) so older readers keep working.
 
-    Returns the number of new slots stored.
+    Runs once per day in steady state: skipped while weather_observed already
+    holds the newest archive day (yesterday), and otherwise retried no more
+    than every _ARCHIVE_RETRY_HOURS. Returns the number of slots stored.
     """
     end_date = date.today() - timedelta(days=1)  # archive lags by ~1 day
     start_date = end_date - timedelta(days=days - 1)
 
-    # Check how many historical slots we already have
-    start_dt = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc)
-    end_dt = datetime(end_date.year, end_date.month, end_date.day, 23, 0, tzinfo=timezone.utc)
+    end_day_start = datetime(end_date.year, end_date.month, end_date.day, tzinfo=timezone.utc)
     with get_conn(db_path) as conn:
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM weather_forecast WHERE slot_start >= ? AND slot_start <= ?",
-            (start_dt.isoformat(), end_dt.isoformat()),
+        have_latest = conn.execute(
+            "SELECT COUNT(*) FROM weather_observed "
+            "WHERE slot_start >= ? AND temperature_c IS NOT NULL",
+            (end_day_start.isoformat(),),
         ).fetchone()[0]
+        last_fetch = conn.execute("SELECT MAX(fetched_at) FROM weather_observed").fetchone()[0]
 
-    if existing >= days * 20:  # ~24 hourly slots/day, allow some gaps
-        logger.debug(
-            "Historical weather already present (%d slots from %s), skipping backfill",
-            existing, start_date,
-        )
+    if have_latest >= 20:  # ~24 hourly slots/day, allow some gaps
+        logger.debug("Observed weather already covers %s, skipping backfill", end_date)
         return 0
+    if last_fetch is not None:
+        age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(last_fetch)).total_seconds() / 3600
+        if age_h < _ARCHIVE_RETRY_HOURS:
+            logger.debug("Archive queried %.1fh ago and %s still missing — waiting", age_h, end_date)
+            return 0
 
     logger.info(
         "Backfilling historical weather %s → %s (%d days)",
@@ -210,6 +230,10 @@ def backfill_weather_history(
             fetched_at,
         ))
 
+    # The archive pads not-yet-available hours with nulls; don't let those
+    # masquerade as observations (they would also defeat the skip check above).
+    observed_rows = [r for r in rows if r[1] is not None]
+
     with get_conn(db_path) as conn:
         conn.executemany(
             """
@@ -221,8 +245,20 @@ def backfill_weather_history(
             """,
             rows,
         )
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO weather_observed
+                (slot_start, temperature_c, cloud_cover_pct, wind_speed_ms,
+                 humidity_pct, precipitation_mm, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            observed_rows,
+        )
 
-    logger.info("Stored %d historical weather slots (%s → %s)", len(rows), start_date, end_date)
+    logger.info(
+        "Stored %d historical weather slots (%d observed) (%s → %s)",
+        len(rows), len(observed_rows), start_date, end_date,
+    )
     return len(rows)
 
 

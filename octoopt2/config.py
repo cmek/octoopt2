@@ -8,18 +8,32 @@ load_dotenv()
 @dataclass(frozen=True)
 class BatteryConfig:
     capacity_kwh: float = 9.5
+    # Planning floor. Keep equal to hw_reserve_pct so plan and hardware agree.
     min_soc_pct: float = 10.0
     max_soc_pct: float = 100.0
     # Round-trip efficiency 93% → split symmetrically: √0.93
     charge_efficiency: float = 0.9644
     discharge_efficiency: float = 0.9644
-    # GivEnergy default max charge/discharge rate (kW) — adjust to your inverter model
-    max_charge_rate_kw: float = 3.6
-    max_discharge_rate_kw: float = 3.6
+    # Sustained AC-side battery power the inverter actually delivers at the
+    # full-scale (50) charge/discharge limit register. Measured on the live
+    # system (Sep–Oct 2026): ≈3.4 kW charging, ≈2.8 kW peak / 2.3 kW average
+    # discharging — well below the 3.6 kW inverter rating previously assumed,
+    # which made every planned export slot ~30% larger than deliverable.
+    max_charge_rate_kw: float = 3.4
+    max_discharge_rate_kw: float = 2.8
     # Virtual cost added to each kWh of battery throughput to avoid thin-margin cycles.
     # Effectively sets a minimum economic spread (~2× this value) before the optimizer
     # will bother cycling the battery. Default 1.5p/kWh.
     cycle_cost_gbp_kwh: float = 0.015
+    # Hardware reserve written to the inverter (both BATTERY_SOC_RESERVE and the
+    # discharge-side power reserve) whenever ECO mode is applied, so the
+    # physical floor always matches the planning floor. GivEnergy ships 4%.
+    hw_reserve_pct: int = 10
+    # Value (£/kWh) credited to energy left in the battery at the end of the
+    # optimisation horizon, so the plan does not drain the battery to the floor
+    # just because the horizon ends. None → use the mean buy price of the
+    # horizon scaled by discharge efficiency; 0 → legacy behaviour (no value).
+    terminal_value_gbp_kwh: float | None = None
 
     @property
     def min_soc_kwh(self) -> float:
@@ -32,6 +46,23 @@ class BatteryConfig:
     @property
     def usable_kwh(self) -> float:
         return self.max_soc_kwh - self.min_soc_kwh
+
+    @classmethod
+    def from_env(cls) -> "BatteryConfig":
+        d = cls()
+        tv = os.getenv("BATTERY_TERMINAL_VALUE_GBP_KWH")
+        return cls(
+            capacity_kwh=float(os.getenv("BATTERY_CAPACITY_KWH", d.capacity_kwh)),
+            min_soc_pct=float(os.getenv("BATTERY_MIN_SOC_PCT", d.min_soc_pct)),
+            max_soc_pct=float(os.getenv("BATTERY_MAX_SOC_PCT", d.max_soc_pct)),
+            charge_efficiency=float(os.getenv("BATTERY_CHARGE_EFFICIENCY", d.charge_efficiency)),
+            discharge_efficiency=float(os.getenv("BATTERY_DISCHARGE_EFFICIENCY", d.discharge_efficiency)),
+            max_charge_rate_kw=float(os.getenv("BATTERY_MAX_CHARGE_KW", d.max_charge_rate_kw)),
+            max_discharge_rate_kw=float(os.getenv("BATTERY_MAX_DISCHARGE_KW", d.max_discharge_rate_kw)),
+            cycle_cost_gbp_kwh=float(os.getenv("BATTERY_CYCLE_COST_GBP_KWH", d.cycle_cost_gbp_kwh)),
+            hw_reserve_pct=int(os.getenv("BATTERY_HW_RESERVE_PCT", d.hw_reserve_pct)),
+            terminal_value_gbp_kwh=None if tv in (None, "", "auto") else float(tv),
+        )
 
 
 @dataclass(frozen=True)
@@ -177,7 +208,7 @@ class AppConfig:
             octopus=OctopusConfig.from_env(),
             solcast=SolcastConfig.from_env(),
             melcloud=MelCloudConfig.from_env(),
-            battery=BatteryConfig(),
+            battery=BatteryConfig.from_env(),
             dhw=DhwConfig.from_env(),
             location=LocationConfig.from_env(),
             daemon=DaemonConfig.from_env(),

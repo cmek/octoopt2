@@ -6,12 +6,15 @@ from zoneinfo import ZoneInfo
 import requests
 
 from ..config import OctopusConfig
-from ..db import get_conn
+from ..db import get_conn, record_fetch
 
 logger = logging.getLogger(__name__)
 
 OCTOPUS_API = "https://api.octopus.energy/v1"
 LONDON = ZoneInfo("Europe/London")
+
+# Standing charges change a few times a year; once a day is plenty.
+STANDING_TTL_HOURS = 24
 
 
 def _fetch_unit_rates(
@@ -105,9 +108,9 @@ def fetch_and_store_prices(
             config.outgoing_tariff_code,
         )
 
-    # Index sell rates by slot start for O(1) lookup
-    sell_by_slot: dict[str, float] = {
-        _normalise_slot(r["valid_from"]): r["value_inc_vat"] / 100
+    # Index sell rates by slot start for O(1) lookup: (inc VAT, exc VAT) £/kWh
+    sell_by_slot: dict[str, tuple[float, float | None]] = {
+        _normalise_slot(r["valid_from"]): (r["value_inc_vat"] / 100, _exc_vat(r))
         for r in sell_rates
     }
 
@@ -119,8 +122,8 @@ def fetch_and_store_prices(
         # Never default to 0.0: a 0 export price is indistinguishable from a free
         # export sink and lets the optimizer round-trip the battery during
         # negative-import slots. Callers default a NULL pessimistically instead.
-        sell_gbp = sell_by_slot.get(slot)
-        rows.append((slot, buy_gbp, sell_gbp))
+        sell_gbp, sell_exc = sell_by_slot.get(slot, (None, None))
+        rows.append((slot, buy_gbp, sell_gbp, _exc_vat(r), sell_exc))
 
     if not rows:
         logger.warning("No price data returned for %s", for_date)
@@ -131,11 +134,14 @@ def fetch_and_store_prices(
             # Both buy and sell available — upsert everything
             conn.executemany(
                 """
-                INSERT INTO prices (slot_start, buy_gbp_kwh, sell_gbp_kwh)
-                VALUES (?, ?, ?)
+                INSERT INTO prices (slot_start, buy_gbp_kwh, sell_gbp_kwh,
+                                    buy_exc_vat_gbp_kwh, sell_exc_vat_gbp_kwh)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(slot_start) DO UPDATE SET
-                    buy_gbp_kwh  = excluded.buy_gbp_kwh,
-                    sell_gbp_kwh = excluded.sell_gbp_kwh
+                    buy_gbp_kwh          = excluded.buy_gbp_kwh,
+                    sell_gbp_kwh         = excluded.sell_gbp_kwh,
+                    buy_exc_vat_gbp_kwh  = excluded.buy_exc_vat_gbp_kwh,
+                    sell_exc_vat_gbp_kwh = excluded.sell_exc_vat_gbp_kwh
                 """,
                 rows,
             )
@@ -145,15 +151,92 @@ def fetch_and_store_prices(
             # clobber a real rate fetched earlier.
             conn.executemany(
                 """
-                INSERT INTO prices (slot_start, buy_gbp_kwh, sell_gbp_kwh)
-                VALUES (?, ?, NULL)
+                INSERT INTO prices (slot_start, buy_gbp_kwh, sell_gbp_kwh,
+                                    buy_exc_vat_gbp_kwh)
+                VALUES (?, ?, NULL, ?)
                 ON CONFLICT(slot_start) DO UPDATE SET
-                    buy_gbp_kwh = excluded.buy_gbp_kwh
+                    buy_gbp_kwh         = excluded.buy_gbp_kwh,
+                    buy_exc_vat_gbp_kwh = excluded.buy_exc_vat_gbp_kwh
                 """,
-                [(slot, buy) for slot, buy, _ in rows],
+                [(slot, buy, buy_exc) for slot, buy, _, buy_exc, _ in rows],
             )
 
     logger.info("Stored %d price slots for %s", len(rows), for_date)
+    return len(rows)
+
+
+def _exc_vat(rate: dict) -> float | None:
+    """value_exc_vat (pence) → £/kWh, or None if the API omitted it."""
+    v = rate.get("value_exc_vat")
+    return None if v is None else v / 100
+
+
+def fetch_and_store_standing_charges(config: OctopusConfig, db_path: str, force: bool = False) -> int:
+    """Fetch the import tariff's standing charge(s) into standing_charges.
+
+    Hits /standing-charges/ for the Agile import tariff. Skipped while the
+    "standing" feed stamp in feed_fetches is younger than STANDING_TTL_HOURS
+    (a skip still re-stamps the feed — it is up to date). Returns the number
+    of validity periods stored (0 if skipped).
+    """
+    if not force:
+        with get_conn(db_path) as conn:
+            row = conn.execute(
+                "SELECT fetched_at FROM feed_fetches WHERE feed = 'standing'"
+            ).fetchone()
+        if row is not None:
+            age_h = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(row["fetched_at"])
+            ).total_seconds() / 3600
+            if age_h < STANDING_TTL_HOURS:
+                logger.debug("Standing charge is %.1fh old (TTL %dh), skipping", age_h, STANDING_TTL_HOURS)
+                record_fetch(db_path, "standing")
+                return 0
+
+    tariff = config.agile_tariff_code
+    product = _product_code_from_tariff(tariff)
+    url = f"{OCTOPUS_API}/products/{product}/electricity-tariffs/{tariff}/standing-charges/"
+    # Only recent/current periods are of interest; one page covers them.
+    period_from = datetime.now(timezone.utc) - timedelta(days=30)
+    resp = requests.get(
+        url,
+        params={"period_from": period_from.strftime("%Y-%m-%dT%H:%MZ"), "page_size": 100},
+        auth=(config.api_key, ""),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    rows = [
+        (
+            tariff,
+            _normalise_slot(r["valid_from"]),
+            _normalise_slot(r["valid_to"]) if r.get("valid_to") else None,
+            r["value_inc_vat"],   # pence/day, as published
+            fetched_at,
+        )
+        for r in results
+    ]
+    if not rows:
+        logger.warning("No standing charges returned for %s", tariff)
+        return 0
+
+    with get_conn(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO standing_charges
+                (tariff_code, valid_from, valid_to, value_inc_vat_p_day, fetched_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(tariff_code, valid_from) DO UPDATE SET
+                valid_to            = excluded.valid_to,
+                value_inc_vat_p_day = excluded.value_inc_vat_p_day,
+                fetched_at          = excluded.fetched_at
+            """,
+            rows,
+        )
+    record_fetch(db_path, "standing")
+    logger.info("Stored %d standing charge period(s) for %s", len(rows), tariff)
     return len(rows)
 
 

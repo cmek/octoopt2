@@ -29,13 +29,18 @@ from .control.ecodan import read_and_store_dhw_state, set_dhw
 from .control.inverter import apply_decision
 from .data.consumption import fetch_and_store_consumption
 from .data.inverter import get_latest_reading, read_and_store
-from .data.octopus import fetch_and_store_prices, get_prices_from, missing_price_dates
+from .data.octopus import (
+    fetch_and_store_prices,
+    fetch_and_store_standing_charges,
+    get_prices_from,
+    missing_price_dates,
+)
 from .data.solcast import fetch_and_store_actuals, fetch_and_store_forecast, get_forecast
 from .data.weather import backfill_weather_history, fetch_and_store_weather, get_temperature_forecast
 from .db import get_conn, record_fetch
 from .optimizer.forecast import fit_load_model, get_temperature_per_slot
 from .optimizer.model import OptimizerInput, optimize
-from .optimizer.schedule import get_current_decision, save_schedule
+from .optimizer.schedule import get_current_decision, record_optimizer_run, save_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +87,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         saved_decision = get_current_decision(config.db_path, now=now)
         if saved_decision is not None:
             try:
-                apply_decision(saved_decision, config.givenergy, config.battery, config.db_path)
+                apply_decision(saved_decision, config.givenergy, config.battery, config.db_path, trigger="fast")
             except Exception as exc:
                 logger.error("Failed to apply inverter decision: %s", exc)
 
@@ -117,10 +122,31 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
             "Load model unavailable — using fallback %.2f kWh/slot", _FALLBACK_LOAD_KWH
         )
 
+    # Every outcome of this slow path (solved / error / fallback) lands in
+    # optimizer_runs. Best-effort and skipped under --dry-run so a manual
+    # inspection run does not pollute the history.
+    model_fields = {
+        "alpha": load_model.alpha if load_model else None,
+        "beta": load_model.dhw_kwh_per_slot if load_model else None,
+        "ref_temp": load_model.ref_temp if load_model else None,
+        "n_train_slots": load_model.n_slots if load_model else None,
+        "manage_dhw": manage_dhw,
+        "soc_start_kwh": initial_soc_kwh,
+    }
+
+    def _record_run(**fields) -> None:
+        if dry_run:
+            return
+        try:
+            record_optimizer_run(config.db_path, **model_fields, **fields)
+        except Exception as exc:
+            logger.warning("Could not record optimizer run: %s", exc)
+
     # ── 6. Build optimizer inputs ──────────────────────────────────────────
     slot_starts = _remaining_slots(config.db_path, now)
     if not slot_starts:
         logger.warning("No price data for upcoming slots — skipping optimization")
+        _record_run(status="fallback", error="no price data for upcoming slots")
         _apply_safe_fallback(config, manage_dhw=manage_dhw, dry_run=dry_run)
         return
 
@@ -135,19 +161,24 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     temperatures = get_temperature_per_slot(config.db_path, slot_starts)
 
     buy_prices, sell_prices, solar_forecast, load_forecast = [], [], [], []
+    last_sell = _last_published_sell(config.db_path, slot_starts[0])
     for slot in slot_starts:
         slot_utc = slot.astimezone(timezone.utc)
         p = price_map.get(slot_utc, {})
         buy = p.get("buy_gbp_kwh", 0.30)
         # Outgoing rate unknown (slot absent, or sell is NULL = not yet
-        # published)? Default pessimistically to the import price rather than 0.
-        # A 0 export price makes grid export look like a free energy sink, which
-        # the optimizer exploits to round-trip the battery during negative-import
-        # slots; mirroring buy removes that incentive until the real rate is
-        # fetched and the schedule is recomputed.
+        # published)? Never 0: a free export sink makes the optimizer churn the
+        # battery during negative-import slots. Mirroring the import price (the
+        # old default) is only pessimistic when prices are negative — in normal
+        # positive slots it over-values export and schedules battery exports
+        # that the real rate never pays for. Use the last published outgoing
+        # rate, capped at the import price, and fall back to the import price
+        # only when no outgoing rate has ever been seen.
         sell = p.get("sell_gbp_kwh")
         if sell is None:
-            sell = buy
+            sell = min(buy, last_sell) if last_sell is not None else buy
+        else:
+            last_sell = sell
         buy_prices.append(buy)
         sell_prices.append(sell)
         solar_forecast.append(solar_map.get(slot_utc, 0.0))
@@ -181,8 +212,23 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         )
     except Exception as exc:
         logger.error("Optimizer failed: %s — applying safe fallback", exc)
+        _record_run(
+            status="error",
+            error=str(exc),
+            horizon_slots=len(slot_starts),
+            horizon_start=slot_starts[0].isoformat(),
+        )
         _apply_safe_fallback(config, manage_dhw=manage_dhw, dry_run=dry_run)
         return
+
+    _record_run(
+        status=result.solver_status,
+        objective_gbp=result.total_cost_gbp,
+        grid_cost_gbp=getattr(result, "grid_cost_gbp", None),
+        solve_seconds=getattr(result, "solve_seconds", None),
+        horizon_slots=len(slot_starts),
+        horizon_start=slot_starts[0].isoformat(),
+    )
 
     # ── 8. Save schedule / write output ───────────────────────────────────
     if output:
@@ -204,6 +250,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     decision = get_current_decision(config.db_path, now=now)
     if decision is None:
         logger.warning("No decision found for current slot — applying safe fallback")
+        _record_run(status="fallback", error="no decision saved for current slot")
         _apply_safe_fallback(config, manage_dhw=manage_dhw, dry_run=dry_run)
         return
 
@@ -216,7 +263,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     )
 
     try:
-        apply_decision(decision, config.givenergy, config.battery, config.db_path)
+        apply_decision(decision, config.givenergy, config.battery, config.db_path, trigger="slow")
     except Exception as exc:
         logger.error("Failed to apply inverter decision: %s", exc)
 
@@ -472,6 +519,12 @@ def _refresh_feeds(config: AppConfig, now: datetime) -> None:
     except Exception as exc:
         logger.warning("Octopus price fetch failed: %s", exc)
 
+    # Octopus standing charge for the import tariff (24h TTL — skips if fresh)
+    try:
+        fetch_and_store_standing_charges(config.octopus, config.db_path)
+    except Exception as exc:
+        logger.warning("Octopus standing charge fetch failed: %s", exc)
+
     # Octopus consumption — refetch a rolling window to catch the API's data lag
     # (typically 1-2 days). The window has to outrun the worst lag, not the
     # typical one: a slot that falls out of it before Octopus publishes it is
@@ -509,6 +562,20 @@ def _refresh_feeds(config: AppConfig, now: datetime) -> None:
         backfill_weather_history(config.location, config.db_path)
     except Exception as exc:
         logger.warning("Weather history backfill failed: %s", exc)
+
+
+def _last_published_sell(db_path: str, before: datetime) -> float | None:
+    """Most recent non-NULL outgoing rate strictly before `before`, if any."""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT sell_gbp_kwh FROM prices
+            WHERE slot_start < ? AND sell_gbp_kwh IS NOT NULL
+            ORDER BY slot_start DESC LIMIT 1
+            """,
+            (before.astimezone(timezone.utc).isoformat(),),
+        ).fetchone()
+    return float(row["sell_gbp_kwh"]) if row else None
 
 
 def _remaining_slots(db_path: str, now: datetime) -> list[datetime]:
@@ -553,74 +620,163 @@ def _apply_safe_fallback(config: AppConfig, *, manage_dhw: bool = True, dry_run:
 
 
 def _record_actuals(config: AppConfig, now: datetime) -> None:
-    """Aggregate inverter readings for the slot that just completed and save to actuals.
+    """Aggregate inverter readings into per-slot actuals.
 
-    The just-completed slot is the one before the current slot.
+    Covers every 30-min slot in the last 24 h that has at least one reading and
+    either no actuals row yet or one written before the battery/SoC columns
+    existed (n_samples IS NULL) — so a missed tick or an upgrade is healed on
+    the next run. Only the just-completed slot (the one before the current
+    slot) is logged, to keep the log at one line per tick.
     """
     slot_end = now.replace(
         minute=(now.minute // 30) * 30,
         second=0,
         microsecond=0,
     )
-    slot_start = slot_end - timedelta(minutes=30)
+    just_finished = slot_end - timedelta(minutes=30)
+    window_start = slot_end - timedelta(hours=24)
 
     with get_conn(config.db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT AVG(solar_w)       AS solar_w,
-                   AVG(grid_import_w) AS grid_import_w,
-                   AVG(grid_export_w) AS grid_export_w,
-                   AVG(load_w)        AS load_w
-            FROM inverter_readings
-            WHERE recorded_at >= ? AND recorded_at < ?
-            """,
-            (slot_start.isoformat(), slot_end.isoformat()),
-        ).fetchone()
+        # One query for the candidate slots. recorded_at is always UTC ISO
+        # "YYYY-MM-DDTHH:MM:SS.ffffff+00:00", so the first 14 chars are the
+        # hour prefix and chars 15-16 the minute — bucket in SQL rather than
+        # pulling every reading into Python.
+        candidates = [
+            r["slot_start"]
+            for r in conn.execute(
+                """
+                WITH buckets AS (
+                    SELECT DISTINCT
+                        substr(recorded_at, 1, 14)
+                        || CASE WHEN CAST(substr(recorded_at, 15, 2) AS INTEGER) < 30
+                                THEN '00' ELSE '30' END
+                        || ':00+00:00' AS slot_start
+                    FROM inverter_readings
+                    WHERE recorded_at >= ? AND recorded_at < ?
+                )
+                SELECT b.slot_start
+                FROM buckets b
+                LEFT JOIN actuals a ON a.slot_start = b.slot_start
+                WHERE a.slot_start IS NULL OR a.n_samples IS NULL
+                ORDER BY b.slot_start
+                """,
+                (window_start.isoformat(), slot_end.isoformat()),
+            )
+        ]
 
-        if rows["solar_w"] is None:
-            return  # no readings in that window
+        for slot_iso in candidates:
+            slot_start = datetime.fromisoformat(slot_iso)
+            summary = _aggregate_slot(conn, slot_start)
+            if summary is None:
+                continue
+            if slot_start == just_finished:
+                logger.info(
+                    "Actuals for %s: import=%.3f kWh export=%.3f kWh solar=%.3f kWh "
+                    "load=%.3f kWh batt +%.3f/-%.3f kWh soc %s→%s%% (n=%d) cost=%s",
+                    slot_start.strftime("%H:%M"),
+                    summary["grid_import_kwh"], summary["grid_export_kwh"],
+                    summary["solar_kwh"], summary["load_kwh"],
+                    summary["battery_charge_kwh"], summary["battery_discharge_kwh"],
+                    summary["soc_start_pct"], summary["soc_end_pct"], summary["n_samples"],
+                    f"£{summary['cost_gbp']:.4f}" if summary["cost_gbp"] is not None else "n/a",
+                )
 
-        # Convert average W over 30 min → kWh
-        factor = 0.5 / 1000
-        solar_kwh = rows["solar_w"] * factor
-        import_kwh = rows["grid_import_w"] * factor
-        export_kwh = rows["grid_export_w"] * factor
-        load_kwh = rows["load_w"] * factor
 
-        # Fetch applicable prices
-        price_row = conn.execute(
-            "SELECT buy_gbp_kwh, sell_gbp_kwh FROM prices WHERE slot_start = ?",
-            (slot_start.isoformat(),),
-        ).fetchone()
+def _aggregate_slot(conn, slot_start: datetime) -> dict | None:
+    """Aggregate inverter_readings for one 30-min slot and upsert into actuals.
 
-        cost_gbp = None
-        if price_row:
-            # sell may be NULL if the outgoing rate was never published for this
-            # slot; mirror the import price (the same pessimistic default the
-            # optimizer used) so the recorded cost stays consistent with the plan.
-            sell = price_row["sell_gbp_kwh"]
-            if sell is None:
-                sell = price_row["buy_gbp_kwh"]
-            cost_gbp = price_row["buy_gbp_kwh"] * import_kwh - sell * export_kwh
+    Returns the stored values, or None when the slot has no readings.
+    Energy = mean power (W) × 0.5 h / 1000; SoC endpoints are the first and
+    last samples in the slot. curtailed_kwh is left NULL: clipped solar cannot
+    be told from the inverter's own readings (they only see what was produced).
+    """
+    slot_end = slot_start + timedelta(minutes=30)
+    window = (slot_start.isoformat(), slot_end.isoformat())
 
-        conn.execute(
-            """
-            INSERT INTO actuals (slot_start, grid_import_kwh, grid_export_kwh,
-                                 solar_kwh, load_kwh, cost_gbp)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(slot_start) DO UPDATE SET
-                grid_import_kwh = excluded.grid_import_kwh,
-                grid_export_kwh = excluded.grid_export_kwh,
-                solar_kwh       = excluded.solar_kwh,
-                load_kwh        = excluded.load_kwh,
-                cost_gbp        = excluded.cost_gbp
-            """,
-            (slot_start.isoformat(), import_kwh, export_kwh, solar_kwh, load_kwh, cost_gbp),
+    rows = conn.execute(
+        """
+        SELECT AVG(solar_w)             AS solar_w,
+               AVG(grid_import_w)       AS grid_import_w,
+               AVG(grid_export_w)       AS grid_export_w,
+               AVG(load_w)              AS load_w,
+               AVG(battery_charge_w)    AS battery_charge_w,
+               AVG(battery_discharge_w) AS battery_discharge_w,
+               COUNT(*)                 AS n
+        FROM inverter_readings
+        WHERE recorded_at >= ? AND recorded_at < ?
+        """,
+        window,
+    ).fetchone()
+    if rows["solar_w"] is None:
+        return None  # no readings in that window
+
+    first = conn.execute(
+        "SELECT soc_pct FROM inverter_readings WHERE recorded_at >= ? AND recorded_at < ? "
+        "ORDER BY recorded_at ASC LIMIT 1",
+        window,
+    ).fetchone()
+    last = conn.execute(
+        "SELECT soc_pct FROM inverter_readings WHERE recorded_at >= ? AND recorded_at < ? "
+        "ORDER BY recorded_at DESC LIMIT 1",
+        window,
+    ).fetchone()
+
+    # Convert average W over 30 min → kWh
+    factor = 0.5 / 1000
+    out = {
+        "solar_kwh": rows["solar_w"] * factor,
+        "grid_import_kwh": rows["grid_import_w"] * factor,
+        "grid_export_kwh": rows["grid_export_w"] * factor,
+        "load_kwh": rows["load_w"] * factor,
+        "battery_charge_kwh": rows["battery_charge_w"] * factor,
+        "battery_discharge_kwh": rows["battery_discharge_w"] * factor,
+        "soc_start_pct": first["soc_pct"] if first else None,
+        "soc_end_pct": last["soc_pct"] if last else None,
+        "n_samples": rows["n"],
+        "cost_gbp": None,
+    }
+
+    # Fetch applicable prices
+    price_row = conn.execute(
+        "SELECT buy_gbp_kwh, sell_gbp_kwh FROM prices WHERE slot_start = ?",
+        (slot_start.isoformat(),),
+    ).fetchone()
+    if price_row:
+        # sell may be NULL if the outgoing rate was never published for this
+        # slot; mirror the import price (the same pessimistic default the
+        # optimizer used) so the recorded cost stays consistent with the plan.
+        sell = price_row["sell_gbp_kwh"]
+        if sell is None:
+            sell = price_row["buy_gbp_kwh"]
+        out["cost_gbp"] = (
+            price_row["buy_gbp_kwh"] * out["grid_import_kwh"] - sell * out["grid_export_kwh"]
         )
 
-    logger.info(
-        "Actuals for %s: import=%.3f kWh export=%.3f kWh solar=%.3f kWh load=%.3f kWh cost=%s",
-        slot_start.strftime("%H:%M"),
-        import_kwh, export_kwh, solar_kwh, load_kwh,
-        f"£{cost_gbp:.4f}" if cost_gbp is not None else "n/a",
+    conn.execute(
+        """
+        INSERT INTO actuals (slot_start, grid_import_kwh, grid_export_kwh,
+                             solar_kwh, load_kwh, cost_gbp,
+                             battery_charge_kwh, battery_discharge_kwh,
+                             soc_start_pct, soc_end_pct, n_samples)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(slot_start) DO UPDATE SET
+            grid_import_kwh       = excluded.grid_import_kwh,
+            grid_export_kwh       = excluded.grid_export_kwh,
+            solar_kwh             = excluded.solar_kwh,
+            load_kwh              = excluded.load_kwh,
+            cost_gbp              = excluded.cost_gbp,
+            battery_charge_kwh    = excluded.battery_charge_kwh,
+            battery_discharge_kwh = excluded.battery_discharge_kwh,
+            soc_start_pct         = excluded.soc_start_pct,
+            soc_end_pct           = excluded.soc_end_pct,
+            n_samples             = excluded.n_samples
+        """,
+        (
+            slot_start.isoformat(),
+            out["grid_import_kwh"], out["grid_export_kwh"],
+            out["solar_kwh"], out["load_kwh"], out["cost_gbp"],
+            out["battery_charge_kwh"], out["battery_discharge_kwh"],
+            out["soc_start_pct"], out["soc_end_pct"], out["n_samples"],
+        ),
     )
+    return out

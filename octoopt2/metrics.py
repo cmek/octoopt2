@@ -75,10 +75,26 @@ class OctooptCollector:
                 g.add_metric([], values[name])
             yield g
 
+        # Optional register extras — only emitted when the reading carries them
+        # (NULL for firmware that lacks the register, or a pre-upgrade reading).
+        extras = {
+            "octoopt2_battery_temp_celsius": ("Battery temperature (°C)", "temp_battery_c"),
+            "octoopt2_inverter_enable_charge": ("Inverter enable-charge register (1 = on)", "hr_enable_charge"),
+            "octoopt2_inverter_enable_discharge": ("Inverter enable-discharge register (1 = on)", "hr_enable_discharge"),
+            "octoopt2_inverter_soc_reserve_percent": ("Inverter battery SoC reserve register (%)", "hr_soc_reserve"),
+            "octoopt2_inverter_power_reserve_percent": ("Inverter discharge min power reserve register (%)", "hr_power_reserve"),
+        }
+        for name, (doc, attr) in extras.items():
+            g = GaugeMetricFamily(name, doc)
+            value = getattr(reading, attr, None) if reading is not None else None
+            if value is not None:
+                g.add_metric([], float(value))
+            yield g
+
         age = GaugeMetricFamily(
             "octoopt2_reading_age_seconds",
             "Seconds since the last successful live inverter poll (in-memory; see "
-            "octoopt2_feed_age_seconds{feed=\"inverter\"} for the persisted history)",
+            "octoopt2_feed_age_seconds{feed=\"inverter\"} for the scheduler's persisted read)",
         )
         if reading is not None:
             age.add_metric([], (now - reading.recorded_at).total_seconds())

@@ -21,7 +21,7 @@ Runs every 5 minutes via cron. Each tick it re-optimizes the remaining half-hour
 | Component | Details |
 |-----------|---------|
 | Inverter | GivEnergy (local Modbus TCP, firmware 912+ / battery firmware 3015+) |
-| Battery | 9.5 kWh, 93% round-trip efficiency |
+| Battery | 9.5 kWh, 93% round-trip efficiency; measured sustained ≈3.4 kW charge / ≈2.8 kW discharge (`BATTERY_MAX_CHARGE_KW` / `BATTERY_MAX_DISCHARGE_KW`) |
 | Solar | Roof PV — forecast via Solcast |
 | Tariff | Octopus Agile (half-hourly buy and sell prices) |
 | Heat pump | Mitsubishi Ecodan (DHW only, via MELCloud API) |
@@ -97,10 +97,14 @@ uv run octoopt2-set-reserve 10      # set the hardware reserve floor to 10%
 
 The value persists in the inverter's flash until changed again. Keep `min_soc_pct` equal to (or just above) the hardware reserve so the plan and the hardware agree.
 
-> Note: every time the daemon switches the inverter to ECO mode it also writes the
-> SoC reserve register (to 4% by default), so a manually set reserve only survives
-> while the daemon is stopped. Use `octoopt2-away` (below) when leaving the system
-> unattended — it writes ECO and the reserve floor together.
+> Every time the daemon switches the inverter to ECO mode it writes **both**
+> reserve registers to `BATTERY_HW_RESERVE_PCT` (default 10, the same as
+> `min_soc_pct`), so plan and hardware agree and a floor left behind by
+> `octoopt2-away --reserve 20` is cleared on the first ECO slot. ECO also
+> disables the charge schedule: before this, the 00:00–23:59 charge window armed
+> by a CHARGE slot stayed active through every following ECO slot, during which
+> the inverter neither discharged to the house nor stopped grid-charging
+> (measured Sep–Oct 2026: the battery served under 1% of load in those slots).
 
 #### Away mode (leaving the system unattended)
 
@@ -261,7 +265,8 @@ Feed freshness is two separate numbers, because they fail independently:
 
 - **`octoopt2_feed_age_seconds{feed=...}`** — seconds since the feed was last
   successfully refreshed, for every persisted source: `solar`, `weather`,
-  `prices`, `consumption`, `inverter`, `dhw`. A fetch skipped because the data is
+  `prices`, `consumption`, `inverter`, `dhw`, `standing` (the import tariff's
+  standing charge). A fetch skipped because the data is
   still inside its TTL counts as a refresh, so every feed is stamped on each
   ~30-minute slot boundary and one alerting threshold fits all of them. This is
   the number that says a feed has gone quiet — alert above ~2 h.
@@ -276,9 +281,10 @@ Keeping these apart matters: before the split, a stalled Octopus fetch and norma
 upstream publication lag produced an identical rising number.
 
 `octoopt2_reading_age_seconds` and `octoopt2_dhw_reading_age_seconds` are a
-different thing again — the daemon's **in-memory** 30 s poll, which never touches
-the database. Use `octoopt2_feed_age_seconds{feed="inverter"}` to check that the
-persisted history the load model is fitted from is still growing.
+different thing again — the age of the daemon's own 30 s / 5-min polls.
+`octoopt2_feed_age_seconds{feed="inverter"}` is stamped only by the scheduler's
+own live read, so it still catches a scheduler that has been falling back to
+stale stored readings while the poller keeps running.
 
 Example scrape config:
 
@@ -290,9 +296,14 @@ scrape_configs:
       - targets: ["192.168.1.x:9876"]
 ```
 
-Prometheus stores the time-series, so the high-frequency readings are not written to
-the SQLite database — only the existing 5-min `inverter_readings` (used by the
-optimizer) are persisted.
+The 30 s inverter polls and 5-min DHW polls are also written to SQLite
+(`inverter_readings`, `dhw_readings`): they feed the load model, the per-slot
+`actuals` (battery flows, SoC endpoints, sample counts) and the backtest.
+Prometheus remains the place to chart them; the database keeps them so the
+optimizer's history does not depend on a scrape. Every optimizer run is logged
+to `optimizer_runs`, every plan revision to `schedule_history`, and every
+Solcast / Open-Meteo forecast revision to `solar_forecast_history` /
+`weather_forecast_history`, with archive observations in `weather_observed`.
 
 #### Live dashboard
 
@@ -361,6 +372,36 @@ Sections:
 - **Solar forecast accuracy** — Solcast p50 vs inverter-measured actual per day, with MAE and bias (positive bias = Solcast over-predicts)
 - **Load forecast accuracy** — optimizer load prediction vs inverter-measured actual per day
 - **Cost outcomes** — planned cost from optimizer schedule vs actual cost from inverter readings, with per-day and cumulative totals
+
+### Backtest (how good was the plan, and what was possible?)
+
+Replays the measured half-hourly load and solar through several strategies and
+tariffs so the controller can be judged against what was physically possible:
+
+```bash
+cp octoopt2.db /tmp/bt.db      # always run against a copy
+uv run octoopt2-backtest --db /tmp/bt.db --from 2026-09-01 --to 2026-10-12
+uv run octoopt2-backtest --db /tmp/bt.db --from 2026-04-02 --to 2026-10-12 \
+    --tariffs agile,cosy+agileout,flux,cosy+fixed,flexible+fixed --cycle-cost 0.015 --json out.json
+```
+
+Per London day and tariff it reports:
+
+- **actual** — the measured flows priced under the tariff (standing charge shown separately)
+- **planned** — the controller's own final plan per slot (DB prices only)
+- **plan-exec** — that plan executed perfectly on a dispatch simulator (SoC chained)
+- **hindsight** — a perfect-foresight MILP over actual load/solar: the ceiling for this hardware
+- **ECO-only** — plain self-consumption with no scheduling; **no-batt** — no battery at all
+- **replay** (`--replay`) — the rolling-horizon MILP re-run with the stored forecasts and perfect execution
+
+`actual − hindsight` is split into an execution gap (`actual − plan-exec`) and a
+planning gap (`plan-exec − hindsight`). The execution-diagnostics table groups
+slots by planned action and the last forced mode, which is how the ECO
+charge-window bug (see below) was found. Alternative tariffs are fetched from the
+public Octopus products API and cached in the DB (`tariff_rates`); banded tariffs
+are expanded in UTC exactly as Octopus publishes them. `--sell-fixed`,
+`--cycle-cost`, `--min-soc`, `--max-discharge-kw` and `--terminal` are the
+sensitivity knobs. `--output` writes `web/backtests/<from>_<to>.json`.
 
 ### Preload historical consumption
 

@@ -15,8 +15,10 @@ optimizer tick so the two never open the socket at the same instant.
 Three concurrent loops:
 
   inverter poller — every INVERTER_POLL_SECONDS, lock-guarded read_inverter()
-                    into shared in-memory state (for /metrics only; not stored).
-  ecodan poller   — every ECODAN_POLL_SECONDS, MELCloud DHW read into state.
+                    into shared in-memory state and, since the load model and
+                    per-slot actuals are built from it, into inverter_readings.
+  ecodan poller   — every ECODAN_POLL_SECONDS, MELCloud DHW read into state and
+                    dhw_readings.
   optimizer tick  — every 5 min (wall-clock aligned), lock-guarded scheduler.run()
                     in a worker thread — the existing fast/slow path, unchanged.
 
@@ -39,8 +41,8 @@ from pathlib import Path
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 
 from .config import AppConfig
-from .control.ecodan import _get_dhw_state_async
-from .data.inverter import InverterReading, read_inverter
+from .control.ecodan import _get_dhw_state_async, store_dhw_state
+from .data.inverter import InverterReading, read_inverter, store_reading
 from .db import init_db
 from .metrics import OctooptCollector
 from .status import build_status
@@ -159,13 +161,27 @@ def _seconds_until_next(period_seconds: int) -> float:
 
 # ── Loops ──────────────────────────────────────────────────────────────────
 
+def _read_and_persist(config: AppConfig) -> InverterReading:
+    """read_inverter() + store_reading(), for the poller's worker thread.
+
+    The store is best-effort: a DB hiccup must not discard a good reading
+    (the in-memory state and /metrics still get it).
+    """
+    reading = read_inverter(config.givenergy)
+    try:
+        store_reading(reading, config.db_path)
+    except Exception as exc:
+        logger.warning("Could not persist inverter poll: %s", exc)
+    return reading
+
+
 async def _poll_inverter_loop(config: AppConfig, state: DaemonState) -> None:
-    """Poll the inverter for live metrics every INVERTER_POLL_SECONDS."""
+    """Poll the inverter every INVERTER_POLL_SECONDS into state and the DB."""
     period = config.daemon.inverter_poll_seconds
     while True:
         try:
             async with state.inverter_lock:
-                reading = await _run_in_daemon_thread(read_inverter, config.givenergy)
+                reading = await _run_in_daemon_thread(_read_and_persist, config)
             state.latest_reading = reading
             state.history.append(reading)
             logger.debug(
@@ -185,6 +201,12 @@ async def _poll_ecodan_loop(config: AppConfig, state: DaemonState) -> None:
             dhw = await _get_dhw_state_async(config.melcloud)
             state.latest_dhw = dhw
             state.latest_dhw_at = datetime.now(timezone.utc)
+            # Persist too (worker thread: SQLite may wait on the optimizer's
+            # write lock). Best-effort — the in-memory state is already set.
+            try:
+                await _run_in_daemon_thread(store_dhw_state, dhw, config.db_path, state.latest_dhw_at)
+            except Exception as exc:
+                logger.warning("Could not persist DHW poll: %s", exc)
             logger.debug(
                 "DHW poll: mode=%s tank=%.1f°C target=%.1f°C",
                 dhw.get("operation_mode"),
