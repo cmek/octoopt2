@@ -10,7 +10,7 @@ Runs every 5 minutes via cron. Each tick it re-optimizes the remaining half-hour
 
 **Battery scheduling** — decides for each 30-minute slot whether to charge from the grid, discharge to meet demand or export, or sit in ECO mode. Decisions are driven by Octopus Agile buy/sell prices, a solar generation forecast, and a predicted household load.
 
-**DHW scheduling** — schedules the Ecodan heat pump's domestic hot water heating into the cheapest available slots each day, subject to a configurable minimum and maximum number of slots. The heat pump's own thermostat still governs when it actually heats; the optimizer just picks the cheapest windows to allow it.
+**DHW scheduling** — schedules the Ecodan heat pump's domestic hot water heating into the cheapest available slots each day, subject to a configurable minimum and maximum number of slots. In a planned slot the Ecodan is put into forced-DHW mode at the normal tank target (`DHW_TARGET_C`, 50 °C). Outside planned slots the tank target is held at `DHW_OFF_TARGET_C` (40 °C, MELCloud's minimum) so the heat pump's own thermostat does not reheat after a shower at whatever price the slot happens to have. Forced mode is one-shot on an Ecodan (it clears itself once the tank reaches target), so the held-low target is what actually keeps DHW off. A comfort guard restores the normal target if the tank falls below `DHW_MIN_TANK_C` (35 °C) in an off slot. `DHW_OFF_MODE=auto` reverts to the legacy behaviour where off slots only clear forced mode and the Ecodan reheats on its own schedule. Slots already executed today count against the daily minimum/maximum, so a mid-day re-plan cannot schedule a fresh full quota.
 
 **Self-correcting** — the optimizer re-runs every 5 minutes with the live battery state of charge, so it continuously adapts to what actually happened (cloud cover, unexpected load, etc.).
 
@@ -114,7 +114,7 @@ period:
 
 ```bash
 sudo systemctl disable --now octoopt2-daemon   # stop AND disable, so a reboot doesn't resurrect it
-uv run octoopt2-away --reserve 20              # inverter → ECO + 20% reserve floor, DHW → auto
+uv run octoopt2-away --reserve 20              # inverter → ECO + 20% reserve floor, DHW → auto at normal target
 ```
 
 The command verifies each register after writing and refuses to run (exit 3) if
@@ -125,7 +125,7 @@ the away state on its next tick. Flags: `--reserve N` (default 20), `--no-dhw`,
 To confirm everything is (still) set correctly — before leaving, or later over
 SSH — run the read-only check; it writes nothing and prints PASS/FAIL for each
 condition (daemon stopped, ECO on, forced discharge off, both reserve registers,
-DHW auto), exiting 0 only when all pass:
+DHW auto at `DHW_TARGET_C`), exiting 0 only when all pass:
 
 ```bash
 uv run octoopt2-away --check                # expects the default 20% reserve
@@ -133,10 +133,11 @@ uv run octoopt2-away --check --reserve 30   # if you applied a different floor
 ```
 
 In ECO mode the battery self-consumes solar and never force-imports or
-force-exports. The Ecodan in `auto` follows its own onboard schedule; for a long
-absence consider also setting MELCloud's holiday mode with your return date.
+force-exports. The Ecodan in `auto` at its normal target follows its own onboard
+schedule (any target held low for an off slot is restored); for a long absence
+consider also setting MELCloud's holiday mode with your return date.
 
-As a backstop, the daemon applies the same safe state (ECO + DHW auto) on every
+As a backstop, the daemon applies the same safe state (ECO + DHW released) on every
 shutdown — a `systemctl stop`, host reboot, or crash-exit lands the hardware in
 ECO rather than a stuck force-charge/force-export window. This fallback restores
 the default 4% reserve, not a custom floor — hence the explicit `octoopt2-away`
@@ -203,6 +204,11 @@ Required environment variables:
 | `MELCLOUD_EMAIL` | MELCloud account email |
 | `MELCLOUD_PASSWORD` | MELCloud account password |
 | `MELCLOUD_DEVICE_ID` | MELCloud device ID (found during setup) |
+| `DHW_MIN_SLOTS_PER_DAY` / `DHW_MAX_SLOTS_PER_DAY` | Daily DHW slot quota (default 4 / 8) |
+| `DHW_OFF_MODE` | `setpoint` (default: hold tank target low outside planned slots) or `auto` (legacy: Ecodan reheats on its own) |
+| `DHW_TARGET_C` | Normal tank target, °C (default 50) — written in planned slots and on release |
+| `DHW_OFF_TARGET_C` | Target held in off slots, °C (default 40, MELCloud's minimum) |
+| `DHW_MIN_TANK_C` | Comfort guard floor, °C (default 35; 0 disables) — below this in an off slot the normal target is restored |
 | `LATITUDE` | Home latitude |
 | `LONGITUDE` | Home longitude |
 
@@ -244,7 +250,7 @@ Flags: `--no-dhw` (see below), `--output` (write `web/schedule.json` each tick),
 
 Supervise it however you like (systemd, tmux, `nohup`, a container). It logs to
 stdout and shuts down cleanly on SIGINT/SIGTERM. On shutdown it applies a safe
-fallback — inverter → ECO, DHW → auto (skipped under `--dry-run`, DHW part
+fallback — inverter → ECO, DHW → auto at `DHW_TARGET_C` (skipped under `--dry-run`, DHW part
 skipped under `--no-dhw`) — so a stop or reboot never strands the inverter in a
 force-charge/force-export window. Worst case this takes ~60 s against an
 unreachable inverter, so if you run it under systemd keep `TimeoutStopSec` at
@@ -344,7 +350,7 @@ To run without active DHW scheduling (Ecodan stays in its own auto mode):
 uv run octoopt2 --no-dhw
 ```
 
-This still controls the battery normally. On each tick it sends an `auto` command to MELCloud so the heat pump falls back to its internal schedule.
+This still controls the battery normally. On each slot boundary it releases the Ecodan — `auto` mode at `DHW_TARGET_C` — so the heat pump falls back to its internal schedule at its normal target.
 
 ---
 

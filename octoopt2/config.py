@@ -86,6 +86,16 @@ class GivEnergyConfig:
         )
 
 
+# How the controller holds the Ecodan off outside planned DHW slots.
+#   "setpoint" — lower the tank target to off_target_c so the heat pump's own
+#                thermostat does not reheat after a shower until a planned slot
+#                (or the comfort guard) restores target_c. Default.
+#   "auto"     — legacy: only clear forced-DHW mode and leave the target alone.
+#                The Ecodan then reheats on its own schedule whenever the tank
+#                drops, regardless of price.
+DHW_OFF_MODES = ("setpoint", "auto")
+
+
 @dataclass(frozen=True)
 class DhwConfig:
     # Power draw during DHW heating mode (kW) — Mitsubishi Ecodan typical
@@ -94,6 +104,25 @@ class DhwConfig:
     min_slots_per_day: int = 4
     # Maximum slots per day (prevents over-heating the tank)
     max_slots_per_day: int = 8
+    # See DHW_OFF_MODES.
+    off_mode: str = "setpoint"
+    # Normal tank target (°C): written in planned-ON slots and whenever control
+    # is released (safe fallback, shutdown, away mode, comfort guard).
+    target_c: float = 50.0
+    # Tank target held in planned-off slots under off_mode="setpoint". 40 °C is
+    # the lowest MELCloud accepts for an Ecodan tank.
+    off_target_c: float = 40.0
+    # Comfort guard: in an off slot, a tank below this (°C) gets target_c back
+    # so a heavy-use day never ends cold. 0 disables the guard.
+    min_tank_c: float = 35.0
+
+    def __post_init__(self) -> None:
+        if self.off_mode not in DHW_OFF_MODES:
+            raise ValueError(f"DHW_OFF_MODE must be one of {DHW_OFF_MODES}, got {self.off_mode!r}")
+        if not (self.off_target_c <= self.target_c):
+            raise ValueError("DHW_OFF_TARGET_C must not exceed DHW_TARGET_C")
+        if self.min_tank_c and not (self.min_tank_c < self.off_target_c):
+            raise ValueError("DHW_MIN_TANK_C must be below DHW_OFF_TARGET_C (or 0 to disable)")
 
     @classmethod
     def from_env(cls) -> "DhwConfig":
@@ -101,6 +130,10 @@ class DhwConfig:
             power_kw=float(os.getenv("DHW_POWER_KW", "1.5")),
             min_slots_per_day=int(os.getenv("DHW_MIN_SLOTS_PER_DAY", "4")),
             max_slots_per_day=int(os.getenv("DHW_MAX_SLOTS_PER_DAY", "8")),
+            off_mode=os.getenv("DHW_OFF_MODE", "setpoint").strip().lower(),
+            target_c=float(os.getenv("DHW_TARGET_C", "50")),
+            off_target_c=float(os.getenv("DHW_OFF_TARGET_C", "40")),
+            min_tank_c=float(os.getenv("DHW_MIN_TANK_C", "35")),
         )
 
 

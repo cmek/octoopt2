@@ -462,7 +462,7 @@ function render(d) {
   const dhwCard = `
     <div class="card">
       <div class="card-head"><span class="card-label">Hot water</span>
-        <span class="pill ${dhw.heating?'pill-on':'pill-off'}">${dhw.heating?'heating':(dhw.mode||'—')}</span></div>
+        <span class="pill ${dhw.heating?'pill-on':'pill-off'}">${dhw.heating?'heating':(dhw.control==='held_low'?'held '+(dhw.target_temp_c==null?'low':dhw.target_temp_c.toFixed(0)+'°'):(dhw.mode||'—'))}</span></div>
       <div class="card-value" style="color:var(--teal)">${dhwTemp==null?'—':dhwTemp.toFixed(1)+'°'}</div>
       <div class="card-row" style="margin-top:6px"><span class="k">Target</span><span class="v">${dhw.target_temp_c==null?'—':dhw.target_temp_c.toFixed(1)+'°C'}</span></div>
       <div class="card-row"><span class="k">Planned this slot</span><span class="v">${pl.dhw_on==null?'—':(pl.dhw_on?'ON':'off')}</span></div>

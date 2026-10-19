@@ -25,7 +25,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from .config import AppConfig
-from .control.ecodan import read_and_store_dhw_state, set_dhw
+from .control.ecodan import apply_dhw, dhw_command, read_and_store_dhw_state, release_command, release_dhw
 from .control.inverter import apply_decision
 from .data.consumption import fetch_and_store_consumption
 from .data.inverter import get_latest_reading, read_and_store
@@ -111,9 +111,11 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     _refresh_feeds(config, now)
 
     # ── 4b. Log ground-truth DHW tank state (best-effort) ──────────────────
-    # One MELCloud read per slot boundary; failures are logged, not fatal.
+    # One MELCloud read per slot boundary; failures are logged, not fatal. The
+    # tank temperature also feeds the comfort guard in step 9.
+    dhw_state = None
     if not dry_run:
-        read_and_store_dhw_state(config.melcloud, config.db_path)
+        dhw_state = read_and_store_dhw_state(config.melcloud, config.db_path)
 
     # ── 5. Fit load model ─────────────────────────────────────────────────
     load_model = fit_load_model(config.db_path)
@@ -199,11 +201,15 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     )
 
     # ── 7. Optimize ────────────────────────────────────────────────────────
+    # DHW slots already executed today count against today's min/max, or every
+    # re-run would plan a fresh full quota into the remaining slots.
+    dhw_done = _dhw_slots_done_today(config.db_path, now) if manage_dhw else None
     try:
         result = optimize(
             inputs, config.battery, config.dhw, config.givenergy,
             manage_dhw=manage_dhw,
             dhw_kwh_per_slot=load_model.dhw_kwh_per_slot if load_model else None,
+            dhw_done_today=dhw_done,
         )
         logger.info(
             "Optimization complete: status=%s total_cost=£%.4f",
@@ -268,7 +274,11 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         logger.error("Failed to apply inverter decision: %s", exc)
 
     try:
-        set_dhw(config.melcloud, decision.dhw_on if manage_dhw else False)
+        if manage_dhw:
+            tank_c = dhw_state.get("tank_temperature") if dhw_state else None
+            apply_dhw(config.melcloud, dhw_command(decision.dhw_on, tank_c, config.dhw))
+        else:
+            apply_dhw(config.melcloud, release_command(config.dhw))
     except Exception as exc:
         logger.error("Failed to apply DHW decision: %s", exc)
 
@@ -291,7 +301,7 @@ def _print_dry_run(result, inputs, now: datetime, config: AppConfig, manage_dhw:
     print(f"  Solver status: {result.solver_status}")
     print(f"  Total cost   : £{result.total_cost_gbp:.4f}")
     print(f"  Slots        : {len(result.decisions)}")
-    print(f"  DHW control  : {'managed by optimizer' if manage_dhw else 'disabled (auto)'}")
+    print(f"  DHW control  : {_dhw_control_label(config, manage_dhw)}")
     print("=" * 100)
 
     # Column header
@@ -380,10 +390,22 @@ def _print_dry_run(result, inputs, now: datetime, config: AppConfig, manage_dhw:
         else:
             print(f"    Inverter : ECO — set_mode_dynamic()")
         if manage_dhw:
-            print(f"    Ecodan   : DHW {'force_hot_water' if d.dhw_on else 'auto (off)'}")
+            cmd = dhw_command(d.dhw_on, None, config.dhw)
+            print(f"    Ecodan   : DHW {'ON' if d.dhw_on else 'off'} → {cmd.describe()}")
         else:
-            print(f"    Ecodan   : DHW unmanaged (auto)")
+            print(f"    Ecodan   : DHW unmanaged → {release_command(config.dhw).describe()}")
     print()
+
+
+def _dhw_control_label(config: AppConfig, manage_dhw: bool) -> str:
+    if not manage_dhw:
+        return "disabled (auto)"
+    if config.dhw.off_mode == "auto":
+        return "managed by optimizer (off slots: auto — Ecodan may still reheat)"
+    return (
+        f"managed by optimizer (off slots: target held at {config.dhw.off_target_c:g}°C, "
+        f"ON: forced to {config.dhw.target_c:g}°C)"
+    )
 
 
 # ── Web output ───────────────────────────────────────────────────────────────
@@ -476,6 +498,9 @@ def _write_web_output(result, inputs, now: datetime, config: AppConfig, manage_d
         "solver_status":  result.solver_status,
         "total_cost_gbp": round(result.total_cost_gbp, 4),
         "manage_dhw":     manage_dhw,
+        "dhw_off_mode":   config.dhw.off_mode,
+        "dhw_target_c":   config.dhw.target_c,
+        "dhw_off_target_c": config.dhw.off_target_c,
         "battery_capacity_kwh": config.battery.capacity_kwh,
         "schedule":       slots,
         "yesterday":      yesterday_summary,
@@ -597,15 +622,38 @@ def _remaining_slots(db_path: str, now: datetime) -> list[datetime]:
     return [p["slot_start"].astimezone(timezone.utc) for p in prices]
 
 
-def _apply_safe_fallback(config: AppConfig, *, manage_dhw: bool = True, dry_run: bool = False) -> None:
-    """Apply a safe state when the optimizer cannot run: eco mode, DHW auto.
+def _dhw_slots_done_today(db_path: str, now: datetime) -> dict[date, int]:
+    """Planned-ON DHW slots already executed today, keyed by UK date.
 
-    Best-effort — never raises. Also used as the daemon's shutdown fallback.
+    `schedule` keeps the last plan for each slot, and the last plan covering a
+    past slot is the one solved at that slot's boundary — i.e. the decision that
+    was actually sent to the Ecodan. Counting those from UK midnight up to (but
+    excluding) the current slot gives the quota already used, which optimize()
+    subtracts from today's min/max.
+    """
+    current_slot = now.replace(minute=(now.minute // 30) * 30, second=0, microsecond=0)
+    local_midnight = current_slot.astimezone(LONDON).replace(hour=0, minute=0, second=0, microsecond=0)
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM schedule WHERE dhw_on = 1 AND slot_start >= ? AND slot_start < ?",
+            (local_midnight.astimezone(timezone.utc).isoformat(),
+             current_slot.astimezone(timezone.utc).isoformat()),
+        ).fetchone()
+    done = int(row["n"]) if row else 0
+    return {local_midnight.date(): done} if done else {}
+
+
+def _apply_safe_fallback(config: AppConfig, *, manage_dhw: bool = True, dry_run: bool = False) -> None:
+    """Apply a safe state when the optimizer cannot run: eco mode, DHW released.
+
+    "Released" = auto mode at the normal tank target, so a target lowered for an
+    off slot never outlives the controller. Best-effort — never raises. Also
+    used as the daemon's shutdown fallback.
     """
     if dry_run:
         logger.info("Dry-run — skipping safe fallback hardware writes")
         return
-    logger.info("Applying safe fallback: eco mode, DHW auto")
+    logger.info("Applying safe fallback: eco mode, DHW %s", release_command(config.dhw).describe())
     try:
         from .control.inverter import set_eco_mode
         set_eco_mode(config.givenergy, config.db_path, skip_if_current=True)
@@ -614,7 +662,7 @@ def _apply_safe_fallback(config: AppConfig, *, manage_dhw: bool = True, dry_run:
 
     if manage_dhw:
         try:
-            set_dhw(config.melcloud, enabled=False)
+            release_dhw(config.melcloud, config.dhw)
         except Exception as exc:
             logger.error("Safe fallback DHW command failed: %s", exc)
 
