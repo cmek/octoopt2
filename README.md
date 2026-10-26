@@ -143,6 +143,27 @@ ECO rather than a stuck force-charge/force-export window. This fallback restores
 the default 4% reserve, not a custom floor — hence the explicit `octoopt2-away`
 step above.
 
+### Axle Energy events (optional)
+
+[Axle](https://vpp.axle.energy/) pays per kWh of metered export during short grid
+events (3–6 a month, notified a day ahead) and sends its own export command to the
+inverter through the GivEnergy cloud. In Axle's *Events Only* mode octoopt2 keeps
+control the rest of the time. Set `AXLE_TOKEN` (Account Settings → Home Assistant
+in the Axle app) and the daemon:
+
+- polls Axle's next-event endpoint on the slow path and stores it in `axle_events`;
+- adds the payment (`AXLE_EXPORT_GBP_KWH`, default £1/kWh) to the sell price of the
+  event's slots when optimizing, so the plan fills the battery beforehand and exports
+  at full power through it (`schedule.axle_uplift_gbp_kwh` records the uplift; the
+  stored buy/sell prices stay the real tariff);
+- holds `DISCHARGE_EXPORT` at max power for the whole event (`CHARGE` for an import
+  event), logged with trigger `axle`, so its writes and Axle's agree. The register
+  drift check re-asserts the mode if anything else changes it;
+- shows the next/active event on the status page.
+
+`octoopt2-backtest --axle-events events.json` applies the same uplift to every
+strategy so the value of past events can be measured.
+
 ### Persistence
 
 All data is stored in a local SQLite database (WAL mode). Tables:

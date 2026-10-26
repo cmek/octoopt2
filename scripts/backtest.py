@@ -73,6 +73,8 @@ def main() -> None:
     ap.add_argument("--replay-solar", choices=["p50", "pred", "actual"], default="p50")
     ap.add_argument("--replay-load", choices=["pred", "actual"], default="pred")
     ap.add_argument("--solar-scale", type=float, default=1.0, help="multiply the replay's solar forecast")
+    ap.add_argument("--axle-events", default=None, metavar="PATH",
+                    help="JSON list of Axle events [{start_time,end_time,import_export}]; their payment is added to every strategy's prices")
     ap.add_argument("--refresh-tariffs", action="store_true")
     ap.add_argument("--json", dest="json_path", default=None)
     ap.add_argument("--output", action="store_true", help="write web/backtests/<from>_<to>.json + index.json")
@@ -116,6 +118,13 @@ def main() -> None:
         live = os.getenv("OCTOPUS_IMPORT_TARIFF_CODE") or os.getenv("OCTOPUS_AGILE_TARIFF_CODE")
         args.standing_product = "-".join(live.split("-")[2:-1]) if live else "AGILE-24-10-01"
 
+    axle_events = []
+    if args.axle_events:
+        from octoopt2.data.axle import parse_event
+        with open(args.axle_events) as fh:
+            axle_events = [e for e in (parse_event(x) for x in json.load(fh)) if e is not None]
+        print(f"Axle: {len(axle_events)} event(s) loaded from {args.axle_events}", file=sys.stderr)
+
     def price_for_factory(pair):
         def price_for(seg):
             ps = T.load_price_series(
@@ -124,11 +133,18 @@ def main() -> None:
                 api_key=api_key, refresh=args.refresh_tariffs,
             )
             sell = [args.sell_fixed] * len(ps.sell) if args.sell_fixed is not None else ps.sell
+            buy = ps.buy
+            if axle_events:
+                from octoopt2.config import AxleConfig
+                from octoopt2.data.axle import slot_uplift
+                up = slot_uplift(axle_events, [s.slot_start for s in seg.slots], AxleConfig())
+                buy = [b + min(u, 0.0) for b, u in zip(buy, up)]
+                sell = [x + max(u, 0.0) for x, u in zip(sell, up)]
             standing = ps.standing_by_day
             if pair.import_product is None:
                 # DB prices are the live import tariff: price the standing charge from its product
                 standing = _standing_for(args.db, args.standing_product, args.region, seg, api_key, args.refresh_tariffs)
-            return ps.buy, sell, standing, ps.notes
+            return buy, sell, standing, ps.notes
         return price_for
 
     rolling = RollingOptions(replan_every=args.replan_every, time_limit_s=min(args.time_limit, 20),

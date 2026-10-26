@@ -231,6 +231,17 @@ CREATE TABLE IF NOT EXISTS standing_charges (
     fetched_at           TEXT NOT NULL,
     PRIMARY KEY (tariff_code, valid_from)
 );
+
+-- Axle Energy grid events (Events Only mode). The API returns only the next
+-- event, so future rows other than the latest fetched one are pruned; past
+-- rows are kept as history.
+CREATE TABLE IF NOT EXISTS axle_events (
+    start_utc   TEXT NOT NULL PRIMARY KEY,  -- ISO8601 UTC
+    end_utc     TEXT NOT NULL,
+    direction   TEXT NOT NULL,              -- export | import
+    updated_at  TEXT,                       -- Axle's updated_at
+    fetched_at  TEXT NOT NULL
+);
 """
 
 
@@ -243,6 +254,7 @@ CREATE TABLE IF NOT EXISTS standing_charges (
 # (inverter and dhw stamp each row with the moment it was read).
 FEEDS: tuple[tuple[str, str | None], ...] = (
     ("solar", "solar_forecast"),
+    ("axle", None),       # Axle VPP event feed; never stamped (grey) unless AXLE_TOKEN is set
     ("weather", "weather_forecast"),
     ("consumption", "consumption"),
     ("prices", "prices"),
@@ -324,6 +336,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("inverter_readings", "hr_charge_limit", "INTEGER"),
     ("inverter_readings", "hr_discharge_limit", "INTEGER"),
     ("inverter_readings", "hr_eco_mode", "INTEGER"),
+    # schedule — Axle event payment folded into the plan's prices (NULL = none);
+    # buy/sell stay the true tariff so cost accounting is unchanged
+    ("schedule", "axle_uplift_gbp_kwh", "REAL"),
+    ("schedule_history", "axle_uplift_gbp_kwh", "REAL"),
     # actuals — battery flows and SoC endpoints per slot
     ("actuals", "battery_charge_kwh", "REAL"),
     ("actuals", "battery_discharge_kwh", "REAL"),

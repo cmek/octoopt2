@@ -194,6 +194,30 @@ def _planner_and_cost(db_path: str, now: datetime) -> tuple[dict, dict, list]:
     return planner, cost, upcoming
 
 
+def _axle(db_path: str, now: datetime, axle_cfg=None) -> dict:
+    """Next/active Axle event and the plan's export through it."""
+    if axle_cfg is None or not getattr(axle_cfg, "enabled", False):
+        return {"enabled": False}
+    from .data.axle import active_event, next_event
+    ev = active_event(db_path, now, axle_cfg.hold_margin_minutes) or next_event(db_path, now)
+    out: dict = {"enabled": True, "next_event": None, "active": False, "planned_export_kwh": None}
+    if ev is None:
+        return out
+    out["next_event"] = {
+        "start": ev.start.isoformat(), "end": ev.end.isoformat(), "direction": ev.direction,
+        "updated_at": ev.updated_at.isoformat() if ev.updated_at else None,
+    }
+    out["active"] = ev.active(now, axle_cfg.hold_margin_minutes)
+    first_slot = ev.start.replace(minute=(ev.start.minute // 30) * 30, second=0, microsecond=0)
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT SUM(grid_export_kwh) AS e FROM schedule WHERE slot_start >= ? AND slot_start < ?",
+            (first_slot.isoformat(), ev.end.isoformat()),
+        ).fetchone()
+    out["planned_export_kwh"] = None if row is None or row["e"] is None else round(row["e"], 2)
+    return out
+
+
 def _feeds(db_path: str, now: datetime) -> dict:
     """Per-feed {fetch_age_s, coverage_lag_s} — see db.feed_freshness."""
     try:
@@ -219,7 +243,8 @@ def _history(state) -> list:
 
 
 def build_status(
-    state, db_path: str, capacity_kwh: float, now: datetime | None = None, dhw_cfg=None
+    state, db_path: str, capacity_kwh: float, now: datetime | None = None, dhw_cfg=None,
+    axle_cfg=None,
 ) -> dict:
     """Assemble the full live status snapshot for the dashboard."""
     if now is None:
@@ -234,5 +259,6 @@ def build_status(
         "cost": cost,
         "upcoming": upcoming,
         "feeds": _feeds(db_path, now),
+        "axle": _axle(db_path, now, axle_cfg),
         "history": _history(state),
     }

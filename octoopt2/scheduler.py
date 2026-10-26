@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 from .config import AppConfig
 from .control.ecodan import apply_dhw, dhw_command, read_and_store_dhw_state, release_command, release_dhw
 from .control.inverter import apply_decision
+from .data.axle import AxleAuthError, AxleEvent, active_event, fetch_and_store_axle, get_events, slot_uplift
 from .data.consumption import fetch_and_store_consumption
 from .data.inverter import get_latest_reading, read_and_store
 from .data.octopus import (
@@ -39,7 +40,7 @@ from .data.solcast import fetch_and_store_actuals, fetch_and_store_forecast, get
 from .data.weather import backfill_weather_history, fetch_and_store_weather, get_temperature_forecast
 from .db import get_conn, record_fetch
 from .optimizer.forecast import fit_load_model, get_temperature_per_slot
-from .optimizer.model import OptimizerInput, optimize
+from .optimizer.model import OptimizerInput, SlotDecision, optimize
 from .optimizer.schedule import get_current_decision, record_optimizer_run, save_schedule
 
 logger = logging.getLogger(__name__)
@@ -85,10 +86,13 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     saved_decision = None
     if not dry_run:
         saved_decision = get_current_decision(config.db_path, now=now)
-        if saved_decision is not None:
+        # An active Axle event overrides the plan with max export (or charge)
+        # so our writes agree with Axle's own cloud command.
+        held, event = _axle_hold(config, saved_decision, now)
+        if held is not None:
             try:
-                apply_decision(saved_decision, config.givenergy, config.battery, config.db_path,
-                               trigger="fast", reading=reading)
+                apply_decision(held, config.givenergy, config.battery, config.db_path,
+                               trigger="axle" if event else "fast", reading=reading)
             except Exception as exc:
                 logger.error("Failed to apply inverter decision: %s", exc)
 
@@ -192,6 +196,16 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         else:
             load_forecast.append(_FALLBACK_LOAD_KWH)
 
+    axle_uplift = None
+    if config.axle.enabled:
+        events = get_events(config.db_path, slot_starts[0], slot_starts[-1] + timedelta(minutes=30))
+        if events:
+            axle_uplift = slot_uplift(events, slot_starts, config.axle)
+            logger.info(
+                "Axle: %d event(s) in horizon — price uplift on %d slot(s)",
+                len(events), sum(1 for u in axle_uplift if u),
+            )
+
     inputs = OptimizerInput(
         slot_starts=slot_starts,
         initial_soc_kwh=initial_soc_kwh,
@@ -199,6 +213,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         sell_prices=sell_prices,
         solar_forecast=solar_forecast,
         load_forecast=load_forecast,
+        axle_uplift=axle_uplift,
     )
 
     # ── 7. Optimize ────────────────────────────────────────────────────────
@@ -269,9 +284,10 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         decision.dhw_on,
     )
 
+    held, event = _axle_hold(config, decision, now)
     try:
-        apply_decision(decision, config.givenergy, config.battery, config.db_path,
-                       trigger="slow", reading=reading)
+        apply_decision(held, config.givenergy, config.battery, config.db_path,
+                       trigger="axle" if event else "slow", reading=reading)
     except Exception as exc:
         logger.error("Failed to apply inverter decision: %s", exc)
 
@@ -571,6 +587,16 @@ def _refresh_feeds(config: AppConfig, now: datetime) -> None:
     except Exception as exc:
         logger.warning("Solcast forecast fetch failed: %s", exc)
 
+    # Axle VPP next event (only when AXLE_TOKEN is set). Events are notified a
+    # day ahead, so the 30-min slow-path cadence is plenty.
+    if config.axle.enabled:
+        try:
+            fetch_and_store_axle(config.axle, config.db_path, now=now)
+        except AxleAuthError as exc:
+            logger.error("Axle: %s — regenerate AXLE_TOKEN", exc)
+        except Exception as exc:
+            logger.warning("Axle event fetch failed: %s", exc)
+
     # Solcast actuals (24h TTL — skips if fresh)
     try:
         fetch_and_store_actuals(config.solcast, config.db_path)
@@ -648,22 +674,76 @@ def _dhw_slots_done_today(db_path: str, now: datetime) -> dict[date, int]:
     return {local_midnight.date(): done} if done else {}
 
 
-def _apply_safe_fallback(config: AppConfig, *, manage_dhw: bool = True, dry_run: bool = False) -> None:
+def _axle_event_decision(config: AppConfig, event: AxleEvent, now: datetime) -> SlotDecision:
+    """Synthetic slot decision for an active Axle event: max export for an
+    export event (→ DISCHARGE_EXPORT at register 50), max grid charge for an
+    import event (→ CHARGE at register 50)."""
+    slot = now.replace(minute=(now.minute // 30) * 30, second=0, microsecond=0)
+    if event.direction == "import":
+        kwh = config.battery.max_charge_rate_kw * 0.5
+        return SlotDecision(slot_start=slot, battery_charge_kwh=kwh, battery_discharge_kwh=0.0,
+                            grid_import_kwh=kwh, grid_export_kwh=0.0, dhw_on=False,
+                            soc_start_kwh=0.0, soc_end_kwh=0.0, slot_cost_gbp=0.0)
+    dis = config.battery.max_discharge_rate_kw * 0.5
+    return SlotDecision(slot_start=slot, battery_charge_kwh=0.0, battery_discharge_kwh=dis,
+                        grid_import_kwh=0.0, grid_export_kwh=config.givenergy.max_export_kw * 0.5,
+                        dhw_on=False, soc_start_kwh=0.0, soc_end_kwh=0.0, slot_cost_gbp=0.0)
+
+
+def _axle_hold(
+    config: AppConfig, decision: SlotDecision | None, now: datetime
+) -> tuple[SlotDecision | None, AxleEvent | None]:
+    """Return the decision to apply now and the active Axle event, if any.
+
+    Outside an event (or with Axle disabled) the saved decision is returned
+    unchanged. During an event the plan is replaced by the event decision —
+    even when no plan is saved — so the controller never writes ECO/CHARGE
+    against Axle's export command.
+    """
+    if not config.axle.enabled:
+        return decision, None
+    try:
+        event = active_event(config.db_path, now, config.axle.hold_margin_minutes)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Axle event lookup failed: %s", exc)
+        return decision, None
+    if event is None:
+        return decision, None
+    logger.info("Axle %s event active (%s → %s) — holding event mode", event.direction,
+                event.start.isoformat(timespec="minutes"), event.end.isoformat(timespec="minutes"))
+    return _axle_event_decision(config, event, now), event
+
+
+def _apply_safe_fallback(
+    config: AppConfig, *, manage_dhw: bool = True, dry_run: bool = False, allow_axle_hold: bool = True
+) -> None:
     """Apply a safe state when the optimizer cannot run: eco mode, DHW released.
 
     "Released" = auto mode at the normal tank target, so a target lowered for an
     off slot never outlives the controller. Best-effort — never raises. Also
-    used as the daemon's shutdown fallback.
+    used as the daemon's shutdown fallback (with allow_axle_hold=False: a process
+    that is exiting cannot end an event hold, so it leaves ECO).
     """
     if dry_run:
         logger.info("Dry-run — skipping safe fallback hardware writes")
         return
-    logger.info("Applying safe fallback: eco mode, DHW %s", release_command(config.dhw).describe())
-    try:
-        from .control.inverter import set_eco_mode
-        set_eco_mode(config.givenergy, config.db_path, skip_if_current=True)
-    except Exception as exc:
-        logger.error("Safe fallback inverter command failed: %s", exc)
+    held, event = (None, None)
+    if allow_axle_hold:
+        held, event = _axle_hold(config, None, datetime.now(timezone.utc))
+    if held is not None:
+        logger.info("Safe fallback during Axle %s event: keeping event mode, DHW %s",
+                    event.direction, release_command(config.dhw).describe())
+        try:
+            apply_decision(held, config.givenergy, config.battery, config.db_path, trigger="axle")
+        except Exception as exc:
+            logger.error("Safe fallback inverter command failed: %s", exc)
+    else:
+        logger.info("Applying safe fallback: eco mode, DHW %s", release_command(config.dhw).describe())
+        try:
+            from .control.inverter import set_eco_mode
+            set_eco_mode(config.givenergy, config.db_path, skip_if_current=True)
+        except Exception as exc:
+            logger.error("Safe fallback inverter command failed: %s", exc)
 
     if manage_dhw:
         try:

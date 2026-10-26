@@ -416,6 +416,14 @@ function feedFresh(name, f) {
   return `<div class="feed"><span class="dot" style="background:${color}"></span><span class="name">${name}</span><span class="age">${fmtAge(age)}</span>${cov}</div>`;
 }
 
+function axleText(a) {
+  const ev = a.next_event;
+  if (!ev) return 'no event';
+  const f = t => new Date(t).toLocaleString([], {weekday:'short', hour:'2-digit', minute:'2-digit'});
+  const exp = a.planned_export_kwh == null ? '' : ' · plan ' + a.planned_export_kwh.toFixed(1) + ' kWh';
+  return (a.active ? 'ACTIVE ' : '') + ev.direction + ' ' + f(ev.start) + '–' + f(ev.end) + exp;
+}
+
 function render(d) {
   window._cap = d.battery_capacity_kwh;
   const live = d.live || {};
@@ -476,6 +484,7 @@ function render(d) {
       <div class="card-row" style="margin-top:6px"><span class="k">Pred. load</span><span class="v">${num(pl.predicted_load_kwh,2)} kWh</span></div>
       <div class="card-row"><span class="k">Pred. solar</span><span class="v" style="color:var(--amber)">${num(pl.predicted_solar_kwh,2)} kWh</span></div>
       <div class="card-row"><span class="k">Plan</span><span class="v">${pl.planned ? planSummary(pl.planned) : '—'}</span></div>
+      ${d.axle && d.axle.enabled ? `<div class="card-row"><span class="k">Axle</span><span class="v">${axleText(d.axle)}</span></div>` : ''}
     </div>`;
 
   // ── Sparklines from history ──
@@ -496,7 +505,7 @@ function render(d) {
   // ── Feeds ──
   const feeds = d.feeds || {};
   const feedsHtml = `<section class="card"><div class="card-label" style="margin-bottom:10px">Data feeds</div>
-    <div class="feeds">${['inverter','dhw','solar','weather','prices','consumption'].map(f => feedFresh(f, feeds[f])).join('')}</div></section>`;
+    <div class="feeds">${['inverter','dhw','solar','weather','prices','consumption'].concat(d.axle && d.axle.enabled ? ['axle'] : []).map(f => feedFresh(f, feeds[f])).join('')}</div></section>`;
 
   // ── Upcoming price strip ──
   const up = (d.upcoming || []).slice(0, 24);

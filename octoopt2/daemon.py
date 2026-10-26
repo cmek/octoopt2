@@ -132,7 +132,8 @@ def _make_handler(state: "DaemonState", config: AppConfig):
             if path == "/status.json":
                 try:
                     payload = build_status(
-                        state, config.db_path, config.battery.capacity_kwh, dhw_cfg=config.dhw
+                        state, config.db_path, config.battery.capacity_kwh, dhw_cfg=config.dhw,
+                        axle_cfg=config.axle,
                     )
                     body = json.dumps(payload).encode()
                     self._send(200, "application/json", body, cache=False)
@@ -396,7 +397,7 @@ def _apply_shutdown_fallback(
     t = threading.Thread(
         target=scheduler._apply_safe_fallback,
         args=(config,),
-        kwargs={"manage_dhw": manage_dhw},
+        kwargs={"manage_dhw": manage_dhw, "allow_axle_hold": False},
         name="shutdown-fallback",
         daemon=True,
     )

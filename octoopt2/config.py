@@ -1,6 +1,6 @@
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -235,6 +235,34 @@ class LocationConfig:
 
 
 @dataclass(frozen=True)
+class AxleConfig:
+    """Axle Energy VPP, "Events Only" mode. Off unless AXLE_TOKEN is set.
+
+    Axle pays per kWh of metered export during grid events (and may call import
+    events). The event feed is polled with the token; the optimizer sees the
+    payment as a per-slot price uplift and the controller holds max export
+    (or max charge) through the event so Axle's own cloud command and ours agree.
+    """
+    token: str | None = None
+    export_gbp_kwh: float = 1.0      # paid per kWh exported during an export event
+    import_gbp_kwh: float = 1.0      # credited per kWh imported during an import event
+    hold_margin_minutes: int = 0     # keep the hold this long either side of the event
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token)
+
+    @classmethod
+    def from_env(cls) -> "AxleConfig":
+        return cls(
+            token=os.getenv("AXLE_TOKEN") or None,
+            export_gbp_kwh=float(os.getenv("AXLE_EXPORT_GBP_KWH", "1.0")),
+            import_gbp_kwh=float(os.getenv("AXLE_IMPORT_GBP_KWH", "1.0")),
+            hold_margin_minutes=int(os.getenv("AXLE_HOLD_MARGIN_MINUTES", "0")),
+        )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     givenergy: GivEnergyConfig
     octopus: OctopusConfig
@@ -248,6 +276,7 @@ class AppConfig:
     # Slot duration in minutes (Octopus rates are planned per half-hour; banded
     # tariffs are expanded to half-hours by the price feed)
     slot_minutes: int = 30
+    axle: AxleConfig = field(default_factory=AxleConfig)
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -261,4 +290,5 @@ class AppConfig:
             location=LocationConfig.from_env(),
             daemon=DaemonConfig.from_env(),
             db_path=os.getenv("DB_PATH", "octoopt2.db"),
+            axle=AxleConfig.from_env(),
         )

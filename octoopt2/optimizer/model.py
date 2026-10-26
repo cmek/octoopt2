@@ -30,9 +30,13 @@ DHW per UK calendar day d (manage_dhw):
   quota into the remaining slots.
 
 Objective:
-  minimise Σ_t ( buy_price[t]*grid_import[t] - sell_price[t]*grid_export[t]
+  minimise Σ_t ( buy_eff[t]*grid_import[t] - sell_eff[t]*grid_export[t]
                  + cycle_cost*(bat_charge[t] + bat_discharge[t]) )
            - terminal_value * soc[n]
+  where buy_eff/sell_eff are the tariff prices plus any Axle event uplift
+  (inputs.axle_uplift: + on sell for export events, − on buy for import
+  events). slot_cost_gbp uses the same effective prices so it reflects what the
+  plan is worth; the tariff prices stay in inputs for persistence.
 """
 import logging
 import time
@@ -59,12 +63,24 @@ class OptimizerInput:
     solar_forecast: list[float]   # kWh per slot
     load_forecast: list[float]    # kWh per slot (predicted NON-DHW gross load;
                                   # DHW added separately via dhw_kwh_per_slot)
+    axle_uplift: list[float] | None = None  # £/kWh: >0 added to sell (export
+                                  # event), <0 added to buy (import event)
 
     def __post_init__(self) -> None:
         n = len(self.slot_starts)
         if not (len(self.buy_prices) == len(self.sell_prices)
                 == len(self.solar_forecast) == len(self.load_forecast) == n):
             raise ValueError("All input lists must have the same length")
+        if self.axle_uplift is not None and len(self.axle_uplift) != n:
+            raise ValueError("axle_uplift must have the same length as slot_starts")
+
+    def effective_prices(self) -> tuple[list[float], list[float]]:
+        """(buy, sell) with any Axle uplift applied."""
+        if not self.axle_uplift:
+            return list(self.buy_prices), list(self.sell_prices)
+        buy = [b + min(u, 0.0) for b, u in zip(self.buy_prices, self.axle_uplift)]
+        sell = [s + max(u, 0.0) for s, u in zip(self.sell_prices, self.axle_uplift)]
+        return buy, sell
 
 
 @dataclass
@@ -210,10 +226,12 @@ def optimize(
     # terminal_soc_value so the plan does not drain to the floor merely because
     # the horizon (which can be as short as a few hours before tomorrow's
     # prices are published) ends.
+    buy_eff, sell_eff = inputs.effective_prices()
+    uplift = inputs.axle_uplift or [0.0] * n
     prob += (
         pulp.lpSum(
-            inputs.buy_prices[t] * grid_import[t]
-            - inputs.sell_prices[t] * grid_export[t]
+            buy_eff[t] * grid_import[t]
+            - sell_eff[t] * grid_export[t]
             + battery.cycle_cost_gbp_kwh * (bat_charge[t] + bat_discharge[t])
             for t in range(n)
         )
@@ -259,8 +277,10 @@ def optimize(
         # slots so it can never re-export battery- or grid-sourced energy. The
         # cap is always satisfiable (excess solar = solar − load − bat_charge ≤
         # solar), so it cannot make the problem infeasible. Positive-price slots
-        # are unconstrained here and keep full battery-export arbitrage.
-        if inputs.buy_prices[t] < 0:
+        # are unconstrained here and keep full battery-export arbitrage. An Axle
+        # export event (uplift > 0) pays ~£1/kWh for export, which is a real
+        # payment rather than a churn artefact, so it lifts the cap.
+        if buy_eff[t] < 0 and uplift[t] <= 0:
             prob += grid_export[t] <= solar_t
 
     # ── DHW daily minimums and maximums ───────────────────────────────────
@@ -330,7 +350,7 @@ def optimize(
             dhw_on=bool(round(_val(dhw_on[t]))),
             soc_start_kwh=soc_start,
             soc_end_kwh=soc_end,
-            slot_cost_gbp=inputs.buy_prices[t] * gi - inputs.sell_prices[t] * ge,
+            slot_cost_gbp=buy_eff[t] * gi - sell_eff[t] * ge,
             curtailed_kwh=_val(curtail[t]),
         ))
 
