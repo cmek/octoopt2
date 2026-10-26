@@ -211,7 +211,7 @@ def main() -> int:
     # ── 3. Inverter → ECO + reserve in one batch ───────────────────────────
     print(f"\nSetting inverter to ECO with reserve floor {args.reserve}% …")
     try:
-        set_eco_mode(config.givenergy, config.db_path, reserve_pct=args.reserve)
+        set_eco_mode(config.givenergy, config.db_path, reserve_pct=args.reserve, trigger="away")
     except Exception as exc:
         logger.error("Failed to set ECO mode: %s", exc)
         return 1

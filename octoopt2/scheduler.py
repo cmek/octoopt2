@@ -87,7 +87,8 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         saved_decision = get_current_decision(config.db_path, now=now)
         if saved_decision is not None:
             try:
-                apply_decision(saved_decision, config.givenergy, config.battery, config.db_path, trigger="fast")
+                apply_decision(saved_decision, config.givenergy, config.battery, config.db_path,
+                               trigger="fast", reading=reading)
             except Exception as exc:
                 logger.error("Failed to apply inverter decision: %s", exc)
 
@@ -269,7 +270,8 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     )
 
     try:
-        apply_decision(decision, config.givenergy, config.battery, config.db_path, trigger="slow")
+        apply_decision(decision, config.givenergy, config.battery, config.db_path,
+                       trigger="slow", reading=reading)
     except Exception as exc:
         logger.error("Failed to apply inverter decision: %s", exc)
 

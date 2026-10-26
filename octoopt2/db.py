@@ -133,7 +133,7 @@ CREATE TABLE IF NOT EXISTS inverter_commands (
     ok             INTEGER NOT NULL,    -- 1 = all writes acknowledged
     error          TEXT,
     slot_start     TEXT,                -- slot the decision was for (NULL for fallback/away)
-    trigger        TEXT                 -- fast | slow | fallback | away
+    trigger        TEXT                 -- fast | slow | fallback | away | axle; "+drift" suffix = re-asserted after register drift
 );
 
 CREATE TABLE IF NOT EXISTS feed_fetches (
