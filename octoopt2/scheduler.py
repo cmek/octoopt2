@@ -606,8 +606,11 @@ def _last_published_sell(db_path: str, before: datetime) -> float | None:
 def _remaining_slots(db_path: str, now: datetime) -> list[datetime]:
     """Return upcoming 30-min slots that have price data.
 
-    Starts from the slot containing now, ends at the last slot with
-    price data in the DB (typically 23:00 UK time tomorrow).
+    Starts from the slot containing now, ends at the last slot with buy price
+    data in the DB, capped at 48 h: typically 23:00 UK time tomorrow on Agile,
+    the full 48 h on a banded tariff such as Cosy (rates are published months
+    ahead). Slots whose Outgoing rate is not yet published get the pessimistic
+    ``min(buy, last published sell)`` fallback in ``run``.
     """
     # Round down to current slot boundary
     current_slot = now.replace(

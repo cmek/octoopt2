@@ -56,7 +56,7 @@ def main() -> None:
     ap.add_argument("--db", default=os.getenv("DB_PATH", "octoopt2.db"))
     ap.add_argument("--tariffs", default="agile", help="comma list of pair names/specs (see backtest.tariffs.DEFAULT_PAIRS)")
     ap.add_argument("--region", default=os.getenv("OCTOPUS_DNO_REGION", "G"))
-    ap.add_argument("--standing-product", default="AGILE-24-10-01", help="product whose standing charge applies to DB-priced pairs")
+    ap.add_argument("--standing-product", default=None, help="product whose standing charge applies to DB-priced pairs (default: the configured import tariff's product, else AGILE-24-10-01)")
     ap.add_argument("--sell-fixed", type=float, default=None, help="override every sell price with a constant £/kWh")
     ap.add_argument("--cycle-cost", type=float, default=0.0, help="virtual cycle cost for hindsight (£/kWh)")
     ap.add_argument("--min-soc", type=float, default=None, help="planning/sim floor %% (default: config)")
@@ -111,6 +111,10 @@ def main() -> None:
     from octoopt2.backtest import tariffs as T
     pairs = [T.parse_pair_spec(x.strip()) for x in args.tariffs.split(",") if x.strip()]
     api_key = os.getenv("OCTOPUS_API_KEY")
+    if args.standing_product is None:
+        # DB prices come from the live import tariff; default its product's standing charge.
+        live = os.getenv("OCTOPUS_IMPORT_TARIFF_CODE") or os.getenv("OCTOPUS_AGILE_TARIFF_CODE")
+        args.standing_product = "-".join(live.split("-")[2:-1]) if live else "AGILE-24-10-01"
 
     def price_for_factory(pair):
         def price_for(seg):
@@ -122,7 +126,7 @@ def main() -> None:
             sell = [args.sell_fixed] * len(ps.sell) if args.sell_fixed is not None else ps.sell
             standing = ps.standing_by_day
             if pair.import_product is None:
-                # DB prices are Agile: price the standing charge from the live product
+                # DB prices are the live import tariff: price the standing charge from its product
                 standing = _standing_for(args.db, args.standing_product, args.region, seg, api_key, args.refresh_tariffs)
             return ps.buy, sell, standing, ps.notes
         return price_for

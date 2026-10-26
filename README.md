@@ -1,6 +1,6 @@
 # octoopt2
 
-Home energy cost optimizer for a GivEnergy solar + battery system on Octopus Agile, with optional Mitsubishi Ecodan DHW scheduling.
+Home energy cost optimizer for a GivEnergy solar + battery system on an Octopus smart tariff (Agile, or a banded tariff such as Cosy) with Agile Outgoing export, plus optional Mitsubishi Ecodan DHW scheduling.
 
 Runs every 5 minutes via cron. Each tick it re-optimizes the remaining half-hourly slots for the day using a Mixed Integer Linear Program (MILP), then applies the current slot's decision to the inverter and heat pump.
 
@@ -8,7 +8,7 @@ Runs every 5 minutes via cron. Each tick it re-optimizes the remaining half-hour
 
 ## What it does
 
-**Battery scheduling** — decides for each 30-minute slot whether to charge from the grid, discharge to meet demand or export, or sit in ECO mode. Decisions are driven by Octopus Agile buy/sell prices, a solar generation forecast, and a predicted household load.
+**Battery scheduling** — decides for each 30-minute slot whether to charge from the grid, discharge to meet demand or export, or sit in ECO mode. Decisions are driven by Octopus buy/sell prices (half-hourly Agile or banded Cosy, expanded to half-hours), a solar generation forecast, and a predicted household load.
 
 **DHW scheduling** — schedules the Ecodan heat pump's domestic hot water heating into the cheapest available slots each day, subject to a configurable minimum and maximum number of slots. In a planned slot the Ecodan is put into forced-DHW mode at the normal tank target (`DHW_TARGET_C`, 50 °C). Outside planned slots the tank target is held at `DHW_OFF_TARGET_C` (40 °C, MELCloud's minimum) so the heat pump's own thermostat does not reheat after a shower at whatever price the slot happens to have. Forced mode is one-shot on an Ecodan (it clears itself once the tank reaches target), so the held-low target is what actually keeps DHW off. A comfort guard restores the normal target if the tank falls below `DHW_MIN_TANK_C` (35 °C) in an off slot. `DHW_OFF_MODE=auto` reverts to the legacy behaviour where off slots only clear forced mode and the Ecodan reheats on its own schedule. Slots already executed today count against the daily minimum/maximum, so a mid-day re-plan cannot schedule a fresh full quota.
 
@@ -23,7 +23,7 @@ Runs every 5 minutes via cron. Each tick it re-optimizes the remaining half-hour
 | Inverter | GivEnergy (local Modbus TCP, firmware 912+ / battery firmware 3015+) |
 | Battery | 9.5 kWh, 93% round-trip efficiency; measured sustained ≈3.4 kW charge / ≈2.8 kW discharge (`BATTERY_MAX_CHARGE_KW` / `BATTERY_MAX_DISCHARGE_KW`) |
 | Solar | Roof PV — forecast via Solcast |
-| Tariff | Octopus Agile (half-hourly buy and sell prices) |
+| Tariff | Octopus Agile or Cosy import (banded rates are expanded to half-hours) + Agile Outgoing export |
 | Heat pump | Mitsubishi Ecodan (DHW only, via MELCloud API) |
 | Weather | Open-Meteo (free, no API key) |
 
@@ -149,7 +149,7 @@ All data is stored in a local SQLite database (WAL mode). Tables:
 
 | Table | Contents |
 |-------|----------|
-| `prices` | Half-hourly Agile buy/sell rates |
+| `prices` | Half-hourly buy/sell rates (banded import tariffs expanded) |
 | `consumption` | Octopus smart meter half-hourly net grid import |
 | `solar_forecast` | Solcast p10/p50/p90 per slot |
 | `solar_actuals` | Solcast tuned actuals (retrospective) |
@@ -168,7 +168,7 @@ All data is stored in a local SQLite database (WAL mode). Tables:
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) for dependency management
 - GivEnergy inverter reachable on local network (Modbus TCP port 8899)
-- Octopus Energy account on Agile tariff with API access
+- Octopus Energy account on Agile or Cosy import (any product with published unit rates) with API access
 - Solcast account with a rooftop site configured
 - MELCloud account (only required if using DHW scheduling)
 
@@ -196,8 +196,8 @@ Required environment variables:
 | `OCTOPUS_ACCOUNT_NUMBER` | Octopus account number |
 | `OCTOPUS_MPAN` | Electricity meter MPAN |
 | `OCTOPUS_SERIAL` | Electricity meter serial number |
-| `OCTOPUS_AGILE_TARIFF_CODE` | Full Agile buy tariff code (e.g. `E-1R-AGILE-24-10-01-C`) |
-| `OCTOPUS_OUTGOING_TARIFF_CODE` | Full Agile export tariff code |
+| `OCTOPUS_IMPORT_TARIFF_CODE` | Full import (buy) tariff code, e.g. `E-1R-AGILE-24-10-01-C` or `E-1R-COSY-22-12-08-G`; the product code is derived from it (`OCTOPUS_AGILE_TARIFF_CODE` still works, with a deprecation warning) |
+| `OCTOPUS_OUTGOING_TARIFF_CODE` | Full export (sell) tariff code, normally Agile Outgoing |
 | `OCTOPUS_DNO_REGION` | DNO region letter (e.g. `C` for London) |
 | `SOLCAST_API_KEY` | Solcast API key |
 | `SOLCAST_RESOURCE_ID` | Solcast rooftop site resource ID |
@@ -428,7 +428,8 @@ octoopt2/
   scheduler.py               — main optimization loop (called every 5 min)
   main.py                    — CLI entry point
   data/
-    octopus.py               — Agile prices and consumption from Octopus API
+    octopus.py               — import/export prices and consumption from Octopus API
+    rates.py                 — rate record parsing and band→half-hour expansion
     solcast.py               — solar forecast and actuals from Solcast
     weather.py               — weather forecast + historical backfill from Open-Meteo
     inverter.py              — live inverter readings via Modbus TCP

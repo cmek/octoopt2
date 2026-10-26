@@ -1,4 +1,10 @@
-"""Fetch Octopus Agile half-hourly buy and sell prices."""
+"""Fetch Octopus import/export unit rates into half-hourly ``prices`` rows.
+
+The import tariff may be half-hourly (Agile) or banded (Cosy, Go, Flux): banded
+records are expanded to half-hour slots via ``octoopt2.data.rates``. Export is
+expected to be Agile Outgoing (half-hourly, published ~16:00 for the next day)
+but any product works through the same path.
+"""
 import logging
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -7,6 +13,7 @@ import requests
 
 from ..config import OctopusConfig
 from ..db import get_conn, record_fetch
+from .rates import expand_records, record_from_api, window_slots
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +56,10 @@ def _fetch_unit_rates(
     return results
 
 
-def _agile_window(for_date: date) -> tuple[datetime, datetime]:
-    """Return the UTC window covering the Agile day for a given date.
+def _pricing_window(for_date: date) -> tuple[datetime, datetime]:
+    """Return the UTC window covering the Octopus pricing day for a date.
 
-    Agile runs 23:00–23:00 UK time, so we fetch from 23:00 the prior day
+    Octopus days run 23:00–23:00 UK time, so we fetch from 23:00 the prior day
     to 23:00 on for_date (all UTC).
     """
     start_london = datetime(
@@ -69,15 +76,16 @@ def fetch_and_store_prices(
     db_path: str,
     for_date: date | None = None,
 ) -> int:
-    """Fetch Agile buy and sell prices for a given date and upsert into DB.
+    """Fetch import (buy) and export (sell) prices for a date and upsert into DB.
 
-    Uses the Agile day window (23:00–23:00 UK time). Defaults to today.
-    Returns the number of slots stored.
+    Uses the Octopus day window (23:00–23:00 UK time). Defaults to today.
+    Banded import tariffs are expanded to one row per half-hour slot, so a
+    full day is always 46/48/50 rows. Returns the number of slots stored.
     """
     if for_date is None:
         for_date = datetime.now(LONDON).date()
 
-    period_from, period_to = _agile_window(for_date)
+    period_from, period_to = _pricing_window(for_date)
     logger.info(
         "Fetching prices for %s (UTC %s → %s)",
         for_date,
@@ -86,8 +94,8 @@ def fetch_and_store_prices(
     )
 
     buy_rates = _fetch_unit_rates(
-        tariff_code=config.agile_tariff_code,
-        product_code=_product_code_from_tariff(config.agile_tariff_code),
+        tariff_code=config.import_tariff_code,
+        product_code=_product_code_from_tariff(config.import_tariff_code),
         period_from=period_from,
         period_to=period_to,
         api_key=config.api_key,
@@ -108,22 +116,28 @@ def fetch_and_store_prices(
             config.outgoing_tariff_code,
         )
 
-    # Index sell rates by slot start for O(1) lookup: (inc VAT, exc VAT) £/kWh
-    sell_by_slot: dict[str, tuple[float, float | None]] = {
-        _normalise_slot(r["valid_from"]): (r["value_inc_vat"] / 100, _exc_vat(r))
-        for r in sell_rates
-    }
+    # One row per half-hour slot of the window. Agile records are already
+    # half-hourly (no-op); Cosy/Go/Flux bands cover several slots each and any
+    # band straddling the window edge is clipped by construction.
+    slots = window_slots(period_from, period_to)
+    buy_recs = expand_records(
+        [record_from_api(r) for r in buy_rates], slots, label=config.import_tariff_code
+    )
+    sell_recs = expand_records(
+        [record_from_api(r) for r in sell_rates], slots, label=config.outgoing_tariff_code
+    )
 
     rows = []
-    for r in buy_rates:
-        slot = _normalise_slot(r["valid_from"])
-        buy_gbp = r["value_inc_vat"] / 100
+    for slot, b, sr in zip(slots, buy_recs, sell_recs):
+        if b is None:
+            continue
         # None (→ NULL) when the outgoing rate for this slot isn't published yet.
         # Never default to 0.0: a 0 export price is indistinguishable from a free
         # export sink and lets the optimizer round-trip the battery during
         # negative-import slots. Callers default a NULL pessimistically instead.
-        sell_gbp, sell_exc = sell_by_slot.get(slot, (None, None))
-        rows.append((slot, buy_gbp, sell_gbp, _exc_vat(r), sell_exc))
+        sell_gbp = None if sr is None else sr.value_gbp
+        sell_exc = None if sr is None else sr.value_exc_vat_gbp
+        rows.append((slot.isoformat(), b.value_gbp, sell_gbp, b.value_exc_vat_gbp, sell_exc))
 
     if not rows:
         logger.warning("No price data returned for %s", for_date)
@@ -161,20 +175,14 @@ def fetch_and_store_prices(
                 [(slot, buy, buy_exc) for slot, buy, _, buy_exc, _ in rows],
             )
 
-    logger.info("Stored %d price slots for %s", len(rows), for_date)
+    logger.info("Stored %d half-hour price slots (%d buy records) for %s", len(rows), len(buy_rates), for_date)
     return len(rows)
-
-
-def _exc_vat(rate: dict) -> float | None:
-    """value_exc_vat (pence) → £/kWh, or None if the API omitted it."""
-    v = rate.get("value_exc_vat")
-    return None if v is None else v / 100
 
 
 def fetch_and_store_standing_charges(config: OctopusConfig, db_path: str, force: bool = False) -> int:
     """Fetch the import tariff's standing charge(s) into standing_charges.
 
-    Hits /standing-charges/ for the Agile import tariff. Skipped while the
+    Hits /standing-charges/ for the import tariff. Skipped while the
     "standing" feed stamp in feed_fetches is younger than STANDING_TTL_HOURS
     (a skip still re-stamps the feed — it is up to date). Returns the number
     of validity periods stored (0 if skipped).
@@ -193,7 +201,7 @@ def fetch_and_store_standing_charges(config: OctopusConfig, db_path: str, force:
                 record_fetch(db_path, "standing")
                 return 0
 
-    tariff = config.agile_tariff_code
+    tariff = config.import_tariff_code
     product = _product_code_from_tariff(tariff)
     url = f"{OCTOPUS_API}/products/{product}/electricity-tariffs/{tariff}/standing-charges/"
     # Only recent/current periods are of interest; one page covers them.
@@ -286,7 +294,7 @@ def missing_price_dates(db_path: str, look_ahead_days: int = 2) -> list[date]:
     missing = []
     for offset in range(look_ahead_days):
         d = today + timedelta(days=offset)
-        period_from, period_to = _agile_window(d)
+        period_from, period_to = _pricing_window(d)
         with get_conn(db_path) as conn:
             row = conn.execute(
                 """

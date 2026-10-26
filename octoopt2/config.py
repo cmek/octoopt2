@@ -1,3 +1,4 @@
+import logging
 import os
 from dataclasses import dataclass
 from dotenv import load_dotenv
@@ -137,13 +138,26 @@ class DhwConfig:
         )
 
 
+def _import_tariff_code_from_env() -> str:
+    """OCTOPUS_IMPORT_TARIFF_CODE, falling back to the deprecated
+    OCTOPUS_AGILE_TARIFF_CODE (with a warning) so existing .env files keep working."""
+    code = os.getenv("OCTOPUS_IMPORT_TARIFF_CODE")
+    if code:
+        return code
+    legacy = os.environ["OCTOPUS_AGILE_TARIFF_CODE"]
+    logging.getLogger(__name__).warning(
+        "OCTOPUS_AGILE_TARIFF_CODE is deprecated; rename it to OCTOPUS_IMPORT_TARIFF_CODE"
+    )
+    return legacy
+
+
 @dataclass(frozen=True)
 class OctopusConfig:
     api_key: str
     account_number: str
     mpan: str
     serial: str
-    agile_tariff_code: str
+    import_tariff_code: str   # buy tariff: Agile or a banded tariff such as Cosy
     outgoing_tariff_code: str
     dno_region: str
 
@@ -154,7 +168,7 @@ class OctopusConfig:
             account_number=os.environ["OCTOPUS_ACCOUNT_NUMBER"],
             mpan=os.environ["OCTOPUS_MPAN"],
             serial=os.environ["OCTOPUS_SERIAL"],
-            agile_tariff_code=os.environ["OCTOPUS_AGILE_TARIFF_CODE"],
+            import_tariff_code=_import_tariff_code_from_env(),
             outgoing_tariff_code=os.environ["OCTOPUS_OUTGOING_TARIFF_CODE"],
             dno_region=os.environ["OCTOPUS_DNO_REGION"],
         )
@@ -231,7 +245,8 @@ class AppConfig:
     location: LocationConfig
     daemon: DaemonConfig
     db_path: str
-    # Slot duration in minutes (Octopus Agile is half-hourly)
+    # Slot duration in minutes (Octopus rates are planned per half-hour; banded
+    # tariffs are expanded to half-hours by the price feed)
     slot_minutes: int = 30
 
     @classmethod

@@ -55,8 +55,8 @@ REQUIRED_VARS = [
     ("OCTOPUS_ACCOUNT_NUMBER",   None,           "Octopus account number"),
     ("OCTOPUS_MPAN",             None,           "Electricity meter MPAN"),
     ("OCTOPUS_SERIAL",           None,           "Electricity meter serial"),
-    ("OCTOPUS_AGILE_TARIFF_CODE",None,           "Agile buy tariff code"),
-    ("OCTOPUS_OUTGOING_TARIFF_CODE", None,       "Agile sell tariff code"),
+    ("OCTOPUS_IMPORT_TARIFF_CODE", None,         "Import (buy) tariff code — Agile or Cosy"),
+    ("OCTOPUS_OUTGOING_TARIFF_CODE", None,       "Export (sell) tariff code"),
     ("OCTOPUS_DNO_REGION",       None,           "DNO region letter"),
     ("SOLCAST_API_KEY",          "xxxx",         "Solcast API key"),
     ("SOLCAST_RESOURCE_ID",      "xxxx",         "Solcast rooftop resource ID"),
@@ -116,7 +116,7 @@ def test_octopus(config) -> bool:
 
         # Check the tariff codes resolve
         for label, tariff_code in [
-            ("buy", config.octopus.agile_tariff_code),
+            ("buy", config.octopus.import_tariff_code),
             ("sell", config.octopus.outgoing_tariff_code),
         ]:
             product_code = tariff_code.split("-")[2:-1]
@@ -263,7 +263,7 @@ def seed_consumption(config, days: int = 30) -> None:
 
 
 def seed_prices(config) -> None:
-    _section("4b. Seeding Agile prices (today + tomorrow)")
+    _section("4b. Seeding import/export prices (today + tomorrow)")
     from octoopt2.data.octopus import fetch_and_store_prices
     today = datetime.now(timezone.utc).date()
     tomorrow = today + timedelta(days=1)
@@ -274,7 +274,7 @@ def seed_prices(config) -> None:
             if n > 0:
                 _ok(f"{d}: {n} price slots fetched")
             else:
-                _warn(f"{d}: no prices returned (tomorrow's prices publish after ~4PM UK time)")
+                _warn(f"{d}: no prices returned (tomorrow's Agile Outgoing rates publish after ~4PM UK time)")
         except Exception as exc:
             _fail(f"{d}: {exc}")
 

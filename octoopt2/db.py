@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 SCHEMA = """
--- Half-hourly Octopus Agile prices (buy and sell)
+-- Half-hourly Octopus prices (buy and sell); banded import tariffs are expanded to half-hours
 CREATE TABLE IF NOT EXISTS prices (
     slot_start  TEXT NOT NULL,   -- ISO8601 UTC, e.g. "2024-01-15T14:00:00+00:00"
     buy_gbp_kwh  REAL NOT NULL,
