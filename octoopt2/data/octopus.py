@@ -13,7 +13,7 @@ import requests
 
 from ..config import OctopusConfig
 from ..db import get_conn, record_fetch
-from .rates import expand_records, record_from_api, window_slots
+from .rates import expand_records, record_from_api, window_slots, drop_off_boundary
 
 logger = logging.getLogger(__name__)
 
@@ -121,10 +121,12 @@ def fetch_and_store_prices(
     # band straddling the window edge is clipped by construction.
     slots = window_slots(period_from, period_to)
     buy_recs = expand_records(
-        [record_from_api(r) for r in buy_rates], slots, label=config.import_tariff_code
+        drop_off_boundary([record_from_api(r) for r in buy_rates], config.import_tariff_code),
+        slots, label=config.import_tariff_code,
     )
     sell_recs = expand_records(
-        [record_from_api(r) for r in sell_rates], slots, label=config.outgoing_tariff_code
+        drop_off_boundary([record_from_api(r) for r in sell_rates], config.outgoing_tariff_code),
+        slots, label=config.outgoing_tariff_code,
     )
 
     rows = []

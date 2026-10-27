@@ -6,7 +6,7 @@ import pytest
 
 from octoopt2.config import OctopusConfig
 from octoopt2.data import octopus as O
-from octoopt2.data.rates import expand_records, record_from_api, window_slots
+from octoopt2.data.rates import drop_off_boundary, expand_records, record_from_api, window_slots
 from octoopt2.db import get_conn, init_db
 
 UTC = timezone.utc
@@ -180,6 +180,21 @@ def test_bad_boundary_record_raises_value_error():
         expand_records([record_from_api(bad)], [utc(2026, 11, 10, 4)], label="E-1R-COSY-22-12-08-G")
 
 
+def test_live_feed_drops_bad_boundary_record_and_keeps_the_rest(db, monkeypatch, caplog):
+    d = date(2026, 11, 10)
+    recs = cosy_day(d)
+    recs[1] = api(utc(2026, 11, 10, 4, 15), utc(2026, 11, 10, 7), CHEAP)  # 04-07 band, off boundary
+    _patch_fetch(monkeypatch, {"E-1R-COSY-22-12-08-G": recs,
+                               "E-1R-AGILE-OUTGOING-19-05-13-G": agile_window(d, 15.0)})
+    with caplog.at_level("ERROR"):
+        O.fetch_and_store_prices(cfg(), db, for_date=d)
+    assert "not on a 30-min boundary" in caplog.text
+    rows = _rows(db)
+    assert len(rows) == 48 - 6                                            # the bad band's 6 slots missing
+    assert all(r["buy_gbp_kwh"] is not None for r in rows)
+    assert len(drop_off_boundary([record_from_api(r) for r in recs], "x")) == len(recs) - 1
+
+
 # ── config alias ─────────────────────────────────────────────────────────────
 
 def _env(monkeypatch, **extra):
@@ -203,6 +218,12 @@ def test_import_tariff_env_alias_warns(monkeypatch, caplog):
     with caplog.at_level("WARNING"):
         assert OctopusConfig.from_env().import_tariff_code == "E-1R-AGILE-24-10-01-G"
     assert "deprecated" in caplog.text
+
+
+def test_import_tariff_env_missing_names_the_current_variable(monkeypatch):
+    _env(monkeypatch)
+    with pytest.raises(KeyError, match="OCTOPUS_IMPORT_TARIFF_CODE"):
+        OctopusConfig.from_env()
 
 
 def test_import_tariff_env_new_name_wins(monkeypatch):

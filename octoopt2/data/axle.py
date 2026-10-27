@@ -21,6 +21,7 @@ import requests
 
 from ..config import AxleConfig
 from ..db import get_conn, record_fetch
+from .rates import parse_ts
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +54,7 @@ class AxleEvent:
 def _parse_ts(s) -> datetime | None:
     if not s or not isinstance(s, str):
         return None
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    return parse_ts(s)
 
 
 def parse_event(payload) -> AxleEvent | None:
@@ -96,7 +92,13 @@ def fetch_event(cfg: AxleConfig, session=None) -> AxleEvent | None:
 
 
 def store_event(db_path: str, event: AxleEvent | None, now: datetime | None = None) -> None:
-    """Upsert the next event and prune other future rows (API returns one event)."""
+    """Upsert the next event and prune other *not yet started* rows.
+
+    The API returns only the next event, so once it moves on to the following
+    one the previous row is stale — unless that event is in progress: the feed
+    stops returning it before it ends, and dropping it would release the hold
+    (and the price uplift) mid-event. Started rows are left alone.
+    """
     now = now or datetime.now(timezone.utc)
     with get_conn(db_path) as conn:
         keep = None
@@ -116,7 +118,7 @@ def store_event(db_path: str, event: AxleEvent | None, now: datetime | None = No
                  event.updated_at.isoformat() if event.updated_at else None, now.isoformat()),
             )
         conn.execute(
-            "DELETE FROM axle_events WHERE end_utc > ? AND start_utc != ?",
+            "DELETE FROM axle_events WHERE start_utc > ? AND start_utc != ?",
             (now.isoformat(), keep or ""),
         )
 

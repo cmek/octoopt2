@@ -80,6 +80,11 @@ def validate_env() -> bool:
     from dotenv import load_dotenv
     load_dotenv()
 
+    # The app still accepts the pre-Cosy name; mirror it so the check agrees with config.py.
+    if not os.getenv("OCTOPUS_IMPORT_TARIFF_CODE") and os.getenv("OCTOPUS_AGILE_TARIFF_CODE"):
+        os.environ["OCTOPUS_IMPORT_TARIFF_CODE"] = os.environ["OCTOPUS_AGILE_TARIFF_CODE"]
+        warnings.append("OCTOPUS_AGILE_TARIFF_CODE is deprecated — rename it to OCTOPUS_IMPORT_TARIFF_CODE")
+
     for var, placeholder, description in REQUIRED_VARS:
         val = os.getenv(var)
         if not val:
@@ -89,6 +94,8 @@ def validate_env() -> bool:
         else:
             _ok(f"{var}")
 
+    for msg in warnings:
+        _warn(msg)
     for msg in errors:
         _fail(f"Missing / unset: {msg}")
 

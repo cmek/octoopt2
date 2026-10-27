@@ -76,11 +76,23 @@ class OptimizerInput:
 
     def effective_prices(self) -> tuple[list[float], list[float]]:
         """(buy, sell) with any Axle uplift applied."""
-        if not self.axle_uplift:
-            return list(self.buy_prices), list(self.sell_prices)
-        buy = [b + min(u, 0.0) for b, u in zip(self.buy_prices, self.axle_uplift)]
-        sell = [s + max(u, 0.0) for s, u in zip(self.sell_prices, self.axle_uplift)]
-        return buy, sell
+        return apply_uplift(self.buy_prices, self.sell_prices, self.axle_uplift)
+
+
+def apply_uplift(
+    buy: list[float], sell: list[float], uplift: list[float] | None
+) -> tuple[list[float], list[float]]:
+    """Fold a signed per-slot payment into the prices the optimizer sees.
+
+    uplift > 0 (export event) is added to the sell price; uplift < 0 (import
+    event) is added to the buy price, i.e. the import gets cheaper. One place
+    for the rule, shared by the live optimizer and the backtest.
+    """
+    if not uplift:
+        return list(buy), list(sell)
+    buy_eff = [b + min(u, 0.0) for b, u in zip(buy, uplift)]
+    sell_eff = [s + max(u, 0.0) for s, u in zip(sell, uplift)]
+    return buy_eff, sell_eff
 
 
 @dataclass

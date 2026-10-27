@@ -144,7 +144,12 @@ def _import_tariff_code_from_env() -> str:
     code = os.getenv("OCTOPUS_IMPORT_TARIFF_CODE")
     if code:
         return code
-    legacy = os.environ["OCTOPUS_AGILE_TARIFF_CODE"]
+    legacy = os.getenv("OCTOPUS_AGILE_TARIFF_CODE")
+    if not legacy:
+        raise KeyError(
+            "OCTOPUS_IMPORT_TARIFF_CODE is not set (e.g. E-1R-AGILE-24-10-01-G or "
+            "E-1R-COSY-22-12-08-G); the deprecated OCTOPUS_AGILE_TARIFF_CODE is also accepted"
+        )
     logging.getLogger(__name__).warning(
         "OCTOPUS_AGILE_TARIFF_CODE is deprecated; rename it to OCTOPUS_IMPORT_TARIFF_CODE"
     )

@@ -113,7 +113,8 @@ CREATE TABLE IF NOT EXISTS inverter_last_command (
     applied_at     TEXT NOT NULL,
     mode           TEXT NOT NULL,       -- CHARGE | DISCHARGE_EXPORT | ECO
     power_register INTEGER NOT NULL,    -- charge/discharge limit register (1-50); 0 for ECO
-    total_writes   INTEGER NOT NULL DEFAULT 0  -- cumulative lifetime register writes sent
+    total_writes   INTEGER NOT NULL DEFAULT 0,  -- cumulative lifetime register writes sent
+    trigger        TEXT                 -- trigger of that write; "…+drift" = a one-off re-assert
 );
 
 -- Last successful fetch/write per data source (one row per feed, upserted on
@@ -358,6 +359,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # prices — ex-VAT rates alongside the inc-VAT ones
     ("prices", "buy_exc_vat_gbp_kwh", "REAL"),
     ("prices", "sell_exc_vat_gbp_kwh", "REAL"),
+    # inverter_last_command — trigger of the last write (drift re-assert guard)
+    ("inverter_last_command", "trigger", "TEXT"),
     # optimizer_runs — load-model settings in force for the run
     ("optimizer_runs", "half_life_days", "REAL"),
     ("optimizer_runs", "hdd_base_c", "REAL"),

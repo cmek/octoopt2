@@ -145,3 +145,19 @@ def test_active_event_with_margin(db):
     assert A.active_event(db, utc(2026, 11, 12, 16, 55), margin_minutes=10) is not None
     assert A.active_event(db, utc(2026, 11, 12, 17, 30)) is not None
     assert A.active_event(db, utc(2026, 11, 12, 18, 0)) is None
+
+
+def test_in_progress_event_survives_feed_moving_on(db, monkeypatch):
+    """Mid-event the API already returns the following event (or nothing); the
+    running event must stay so the hold and the uplift last until its end."""
+    nxt = {**FIXTURE, "start_time": "2026-11-13T17:00:00Z", "end_time": "2026-11-13T18:00:00Z"}
+    S, _ = _session(monkeypatch, FakeResp(200, FIXTURE), FakeResp(200, nxt), FakeResp(200, {}))
+    A.fetch_and_store_axle(CFG, db, now=utc(2026, 11, 11, 16), session=S)
+    mid = utc(2026, 11, 12, 17, 30)                                   # inside 17:00-18:30
+    A.fetch_and_store_axle(CFG, db, now=mid, session=S)
+    assert A.active_event(db, mid) is not None
+    assert [e.start for e in A.get_events(db, mid, mid + timedelta(days=2))] == [utc(2026, 11, 12, 17), utc(2026, 11, 13, 17)]
+    A.fetch_and_store_axle(CFG, db, now=mid + timedelta(minutes=30), session=S)   # feed now empty
+    assert A.active_event(db, mid + timedelta(minutes=30)) is not None
+    with get_conn(db) as conn:                                       # but the not-yet-started one is pruned
+        assert conn.execute("SELECT COUNT(*) FROM axle_events").fetchone()[0] == 1

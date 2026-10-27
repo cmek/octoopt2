@@ -163,9 +163,10 @@ def main() -> None:
             if axle_events:
                 from octoopt2.config import AxleConfig
                 from octoopt2.data.axle import slot_uplift
-                up = slot_uplift(axle_events, [s.slot_start for s in seg.slots], AxleConfig())
-                buy = [b + min(u, 0.0) for b, u in zip(buy, up)]
-                sell = [x + max(u, 0.0) for x, u in zip(sell, up)]
+                from octoopt2.optimizer.model import apply_uplift
+                # Same £/kWh the daemon plans with (AXLE_EXPORT_GBP_KWH / AXLE_IMPORT_GBP_KWH).
+                up = slot_uplift(axle_events, [s.slot_start for s in seg.slots], AxleConfig.from_env())
+                buy, sell = apply_uplift(buy, sell, up)
             standing = ps.standing_by_day
             if pair.import_product is None:
                 # DB prices are the live import tariff: price the standing charge from its product

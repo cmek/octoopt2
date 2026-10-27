@@ -11,12 +11,14 @@ on UTC instants -- never via local hours.
 from __future__ import annotations
 
 import bisect
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 LONDON = ZoneInfo("Europe/London")
 UTC = timezone.utc
+logger = logging.getLogger(__name__)
 SLOT = timedelta(minutes=30)
 
 # Payment-method preference when a product publishes both variants for the
@@ -113,11 +115,30 @@ def _lookup(starts: list[datetime], recs: list[RateRecord], t: datetime) -> Rate
     return rec
 
 
+def _on_boundary(r: RateRecord) -> bool:
+    vf = r.valid_from.astimezone(UTC)
+    return vf.minute in (0, 30) and vf.second == 0 and vf.microsecond == 0
+
+
 def _check_boundaries(records: list[RateRecord], label: str) -> None:
     for r in records:
-        vf = r.valid_from.astimezone(UTC)
-        if not (vf.minute in (0, 30) and vf.second == 0 and vf.microsecond == 0):
+        if not _on_boundary(r):
             raise ValueError(f"{label}: valid_from not on a 30-min boundary: {r.valid_from}")
+
+
+def drop_off_boundary(records: list[RateRecord], label: str = "rates") -> list[RateRecord]:
+    """Records whose valid_from is on a half-hour boundary; the rest are logged and dropped.
+
+    The live feed uses this so one malformed record costs its own slots rather
+    than the whole day's fetch (expand_records itself raises, which is what the
+    backtest wants).
+    """
+    good = [r for r in records if _on_boundary(r)]
+    for r in records:
+        if not _on_boundary(r):
+            logger.error("%s: dropping rate record not on a 30-min boundary: %s → %s",
+                         label, r.valid_from, r.valid_to)
+    return good
 
 
 def expand_records(
