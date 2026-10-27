@@ -123,6 +123,9 @@ def test_record_optimizer_run(db_path):
         ref_temp=12.0,
         n_train_slots=1000,
         manage_dhw=True,
+        half_life_days=12.0,
+        hdd_base_c=15.5,
+        train_days=56,
     )
     record_optimizer_run(db_path, run_at=run_at + timedelta(seconds=1), status="error", error="boom")
 
@@ -132,6 +135,8 @@ def test_record_optimizer_run(db_path):
     ok, err = rows
     assert ok["run_at"] == run_at.isoformat()
     assert ok["status"] == "Optimal"
+    assert (ok["half_life_days"], ok["hdd_base_c"], ok["train_days"]) == (12.0, 15.5, 56)
+    assert err["half_life_days"] is None
     assert ok["grid_cost_gbp"] == 1.2
     assert ok["solve_seconds"] == 0.42
     assert ok["manage_dhw"] == 1

@@ -46,14 +46,22 @@ Every tick refreshes data feeds with TTL-aware caching to avoid unnecessary API 
 A temperature-adjusted baseline model is fitted from historical consumption:
 
 ```
-predicted_load[t] = baseline[day_type][slot_index] + α × (temp[t] − ref_temp)
+predicted_load[t] = baseline[day_type][slot_index] + α × max(0, hdd_base − temp[t])
 ```
 
 - `day_type` is one of `weekday`, `weekend`, `holiday` (UK England public holidays)
 - `slot_index` is 0–47, the half-hour position within the UK local day
-- `α` is an OLS-fitted temperature coefficient (kWh per °C)
+- `α` is a least-squares heating-degree coefficient (kWh per °C below `hdd_base`, default 13 °C via `LOAD_MODEL_HDD_BASE_C`,
+  so cold slots add load and warm ones add nothing). Set `LOAD_MODEL_HDD_BASE_C=`
+  (empty) for the legacy linear form `α × (temp − ref_temp)`
+- The fit is recency-weighted: each slot's weight halves every
+  `LOAD_MODEL_HALF_LIFE_DAYS` (default 10; `0` = unweighted) over a
+  `LOAD_MODEL_DAYS` window (default 56), so the baseline follows the season
+- Holidays borrow the weekend baseline when the window holds < 1 weighted holiday
 - Falls back to a baseline-only model (α = 0) when historical weather coverage is insufficient
 - A minimum floor of 0.2 kWh/slot is applied to account for always-on base load
+- `octoopt2-backtest --replay --replay-load model [--load-half-life N --load-hdd-base T]`
+  re-fits the model walk-forward on a DB copy to compare settings
 
 ### Optimization
 

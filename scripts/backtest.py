@@ -71,7 +71,13 @@ def main() -> None:
     ap.add_argument("--replay", action="store_true", help="also run the rolling-horizon replay (slow)")
     ap.add_argument("--replan-every", type=int, default=1)
     ap.add_argument("--replay-solar", choices=["p50", "pred", "actual"], default="p50")
-    ap.add_argument("--replay-load", choices=["pred", "actual"], default="pred")
+    ap.add_argument("--replay-load", choices=["pred", "actual", "model"], default="pred",
+                    help="pred = stored prediction; actual = perfect load; model = re-fit the load model "
+                         "walk-forward each day (see --load-*)")
+    ap.add_argument("--load-half-life", type=float, default=None, help="load model recency half-life in days (0 = unweighted; default: config)")
+    ap.add_argument("--load-hdd-base", default=None, help="heating-degree base °C ('' = legacy linear α; default: config)")
+    ap.add_argument("--load-train-days", type=int, default=None)
+    ap.add_argument("--load-temp", choices=["observed", "forecast"], default="observed", help="temperature source for --replay-load model")
     ap.add_argument("--solar-scale", type=float, default=1.0, help="multiply the replay's solar forecast")
     ap.add_argument("--axle-events", default=None, metavar="PATH",
                     help="JSON list of Axle events [{start_time,end_time,import_export}]; their payment is added to every strategy's prices")
@@ -106,6 +112,26 @@ def main() -> None:
     slots = load_slots(args.db, from_utc, to_utc)
     if not slots:
         sys.exit(f"No price rows between {args.from_} and {args.to} in {args.db}")
+    load_cfg = None
+    if args.replay_load == "model":
+        from dataclasses import replace as _replace
+        from octoopt2.backtest.loadmodel import walk_forward_predictions
+        from octoopt2.config import LoadModelConfig
+        load_cfg = LoadModelConfig.from_env()
+        if args.load_half_life is not None:
+            load_cfg = _replace(load_cfg, half_life_days=args.load_half_life or None)
+        if args.load_hdd_base is not None:
+            base = args.load_hdd_base.strip().lower()
+            load_cfg = _replace(load_cfg, hdd_base_c=None if base in ("", "none") else float(base))
+        if args.load_train_days is not None:
+            load_cfg = _replace(load_cfg, train_days=args.load_train_days)
+        days = sorted({s.london_day for s in slots})
+        print(f"Re-fitting load model walk-forward over {len(days)} days: {load_cfg}", file=sys.stderr)
+        preds = walk_forward_predictions(args.db, days, load_cfg, temp_source=args.load_temp)
+        for s in slots:
+            if s.slot_start in preds:
+                s.pred_load_kwh = preds[s.slot_start]
+        args.replay_load = "pred"
     segments, excluded = segment_days(slots, floor_kwh=battery.min_soc_kwh, capacity_kwh=battery.capacity_kwh)
     n_days = sum(len(s.days) for s in segments)
     print(f"Loaded {len(slots)} slots; {n_days} complete days in {len(segments)} segment(s); {len(excluded)} excluded", file=sys.stderr)
@@ -169,6 +195,7 @@ def main() -> None:
         "max_export_kw": args.max_export_kw, "cycle_cost": args.cycle_cost, "terminal": args.terminal,
         "lookahead_days": args.lookahead_days, "excluded": [(d.isoformat(), r) for d, r in excluded],
         "days": n_days, "replay": vars(rolling) if rolling else None,
+        "load_model": vars(load_cfg) if load_cfg else "stored",
     }
     print(render_markdown(results, diag, acc, meta))
     payload = to_json(results, diag, acc, meta)

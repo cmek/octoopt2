@@ -123,7 +123,7 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         dhw_state = read_and_store_dhw_state(config.melcloud, config.db_path)
 
     # ── 5. Fit load model ─────────────────────────────────────────────────
-    load_model = fit_load_model(config.db_path)
+    load_model = fit_load_model(config.db_path, config.load_model, now=now)
     if load_model is None:
         logger.warning(
             "Load model unavailable — using fallback %.2f kWh/slot", _FALLBACK_LOAD_KWH
@@ -137,6 +137,9 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         "beta": load_model.dhw_kwh_per_slot if load_model else None,
         "ref_temp": load_model.ref_temp if load_model else None,
         "n_train_slots": load_model.n_slots if load_model else None,
+        "half_life_days": config.load_model.half_life_days,
+        "hdd_base_c": config.load_model.hdd_base_c,
+        "train_days": config.load_model.train_days,
         "manage_dhw": manage_dhw,
         "soc_start_kwh": initial_soc_kwh,
     }

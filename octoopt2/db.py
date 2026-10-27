@@ -358,6 +358,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # prices — ex-VAT rates alongside the inc-VAT ones
     ("prices", "buy_exc_vat_gbp_kwh", "REAL"),
     ("prices", "sell_exc_vat_gbp_kwh", "REAL"),
+    # optimizer_runs — load-model settings in force for the run
+    ("optimizer_runs", "half_life_days", "REAL"),
+    ("optimizer_runs", "hdd_base_c", "REAL"),
+    ("optimizer_runs", "train_days", "INTEGER"),
 )
 
 

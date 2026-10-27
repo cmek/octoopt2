@@ -151,6 +151,39 @@ def _import_tariff_code_from_env() -> str:
     return legacy
 
 
+def _opt_float(name: str, default: float | None) -> float | None:
+    """Float env var where "" / "none" / "0" mean "disabled" (None)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    if raw in ("", "none", "off"):
+        return None
+    v = float(raw)
+    return None if v <= 0 else v
+
+
+@dataclass(frozen=True)
+class LoadModelConfig:
+    """Load-forecast model settings (see optimizer.forecast.fit_load_model)."""
+    # How many days of gross-load history the fit looks back over.
+    train_days: int = 56
+    # Exponential recency weighting half-life (days); None → unweighted OLS.
+    half_life_days: float | None = 10.0
+    # Heating-degree base (°C): the temperature term is max(0, base − T), so
+    # cold slots add load and warm ones add nothing. None → legacy linear
+    # α·(T − ref_temp).
+    hdd_base_c: float | None = 13.0
+
+    @classmethod
+    def from_env(cls) -> "LoadModelConfig":
+        return cls(
+            train_days=int(os.getenv("LOAD_MODEL_DAYS", "56")),
+            half_life_days=_opt_float("LOAD_MODEL_HALF_LIFE_DAYS", 10.0),
+            hdd_base_c=_opt_float("LOAD_MODEL_HDD_BASE_C", 13.0),
+        )
+
+
 @dataclass(frozen=True)
 class OctopusConfig:
     api_key: str
@@ -278,6 +311,8 @@ class AppConfig:
     slot_minutes: int = 30
     axle: AxleConfig = field(default_factory=AxleConfig)
 
+    load_model: LoadModelConfig = LoadModelConfig()
+
     @classmethod
     def from_env(cls) -> "AppConfig":
         return cls(
@@ -291,4 +326,6 @@ class AppConfig:
             daemon=DaemonConfig.from_env(),
             db_path=os.getenv("DB_PATH", "octoopt2.db"),
             axle=AxleConfig.from_env(),
+
+            load_model=LoadModelConfig.from_env(),
         )

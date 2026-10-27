@@ -327,9 +327,10 @@ def print_summary(config) -> None:
             count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             _ok(f"{label}: {count} rows")
 
-    model = fit_load_model(config.db_path)
+    model = fit_load_model(config.db_path, config.load_model)
     if model:
-        _ok(f"Load model fitted: α={model.alpha:.4f} kWh/°C, ref={model.ref_temp:.1f}°C, n={model.n_slots} slots")
+        _ok(f"Load model fitted: α={model.alpha:.4f} kWh/°C, ref={model.ref_temp:.1f}°C, "
+            f"hdd_base={model.hdd_base_c}, half_life={model.half_life_days}d, n={model.n_slots} slots")
     else:
         _warn("Load model not fitted — insufficient consumption history (need ≥7 days with weather overlap)")
 

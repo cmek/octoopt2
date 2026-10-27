@@ -108,6 +108,7 @@ _RUN_FIELDS = (
     "status", "objective_gbp", "grid_cost_gbp", "solve_seconds",
     "horizon_slots", "horizon_start", "soc_start_kwh",
     "alpha", "beta", "ref_temp", "n_train_slots", "manage_dhw", "error",
+    "half_life_days", "hdd_base_c", "train_days",
 )
 
 
