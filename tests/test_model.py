@@ -47,3 +47,43 @@ def test_min_terminal_soc_is_honoured(battery, dhw, givenergy):
     assert res.decisions[-1].soc_end_kwh >= 5.0 - 1e-6
     assert res.grid_cost_gbp == pytest.approx(sum(d.slot_cost_gbp for d in res.decisions))
     assert res.solve_seconds > 0
+
+
+# ── Axle event uplift ─────────────────────────────────────────────────────────
+
+def test_axle_uplift_exports_battery_at_cap_in_event_slots(battery, dhw, givenergy):
+    slots, buy, sell, solar, load = synthetic_day()
+    solar = [0.0] * 48
+    uplift = [0.0] * 48
+    uplift[34] = uplift[35] = 1.0            # 17:00–18:00 export event
+    inp = OptimizerInput(slot_starts=slots, initial_soc_kwh=battery.min_soc_kwh, buy_prices=buy,
+                         sell_prices=sell, solar_forecast=solar, load_forecast=load, axle_uplift=uplift)
+    res = optimize(inp, battery, dhw, givenergy, manage_dhw=False, terminal_soc_value_gbp_kwh=0.0)
+    d = res.decisions
+    cap = min(givenergy.max_export_kw, battery.max_discharge_rate_kw) * 0.5
+    assert d[34].grid_export_kwh == pytest.approx(cap - 0.4, abs=0.05) or d[34].grid_export_kwh == pytest.approx(cap, abs=0.05)
+    assert d[34].grid_export_kwh > 0.9 and d[35].grid_export_kwh > 0.9
+    assert d[34].soc_start_kwh > battery.min_soc_kwh + 2.0          # charged beforehand
+    assert d[34].slot_cost_gbp < -0.9 * d[34].grid_export_kwh         # priced at ~£1.15/kWh
+    # tariff prices on the input are untouched
+    assert inp.sell_prices[34] == 0.15
+
+
+def test_axle_export_event_bypasses_negative_price_cap(battery, dhw, givenergy):
+    slots, buy, sell, solar, load = synthetic_day()
+    solar = [0.0] * 48
+    buy = [-0.02] * 48
+    uplift = [0.0] * 48
+    uplift[20] = 1.0
+    inp = OptimizerInput(slot_starts=slots, initial_soc_kwh=battery.max_soc_kwh, buy_prices=buy,
+                         sell_prices=sell, solar_forecast=solar, load_forecast=load, axle_uplift=uplift)
+    res = optimize(inp, battery, dhw, givenergy, manage_dhw=False, terminal_soc_value_gbp_kwh=0.0)
+    assert res.decisions[20].grid_export_kwh > 0.9          # battery export allowed in the event
+    assert all(res.decisions[t].grid_export_kwh < 1e-6 for t in range(48) if t != 20)  # capped elsewhere (no solar)
+
+
+def test_axle_uplift_length_validated(battery):
+    slots, buy, sell, solar, load = synthetic_day()
+    with pytest.raises(ValueError):
+        OptimizerInput(slot_starts=slots, initial_soc_kwh=1.0, buy_prices=buy, sell_prices=sell,
+                       solar_forecast=solar, load_forecast=load, axle_uplift=[0.0])

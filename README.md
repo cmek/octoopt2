@@ -1,6 +1,6 @@
 # octoopt2
 
-Home energy cost optimizer for a GivEnergy solar + battery system on Octopus Agile, with optional Mitsubishi Ecodan DHW scheduling.
+Home energy cost optimizer for a GivEnergy solar + battery system on an Octopus smart tariff (Agile, or a banded tariff such as Cosy) with Agile Outgoing export, plus optional Mitsubishi Ecodan DHW scheduling.
 
 Runs every 5 minutes via cron. Each tick it re-optimizes the remaining half-hourly slots for the day using a Mixed Integer Linear Program (MILP), then applies the current slot's decision to the inverter and heat pump.
 
@@ -8,9 +8,9 @@ Runs every 5 minutes via cron. Each tick it re-optimizes the remaining half-hour
 
 ## What it does
 
-**Battery scheduling** — decides for each 30-minute slot whether to charge from the grid, discharge to meet demand or export, or sit in ECO mode. Decisions are driven by Octopus Agile buy/sell prices, a solar generation forecast, and a predicted household load.
+**Battery scheduling** — decides for each 30-minute slot whether to charge from the grid, discharge to meet demand or export, or sit in ECO mode. Decisions are driven by Octopus buy/sell prices (half-hourly Agile or banded Cosy, expanded to half-hours), a solar generation forecast, and a predicted household load.
 
-**DHW scheduling** — schedules the Ecodan heat pump's domestic hot water heating into the cheapest available slots each day, subject to a configurable minimum and maximum number of slots. The heat pump's own thermostat still governs when it actually heats; the optimizer just picks the cheapest windows to allow it.
+**DHW scheduling** — schedules the Ecodan heat pump's domestic hot water heating into the cheapest available slots each day, subject to a configurable minimum and maximum number of slots. In a planned slot the Ecodan is put into forced-DHW mode at the normal tank target (`DHW_TARGET_C`, 50 °C). Outside planned slots the tank target is held at `DHW_OFF_TARGET_C` (40 °C, MELCloud's minimum) so the heat pump's own thermostat does not reheat after a shower at whatever price the slot happens to have. Forced mode is one-shot on an Ecodan (it clears itself once the tank reaches target), so the held-low target is what actually keeps DHW off. A comfort guard restores the normal target if the tank falls below `DHW_MIN_TANK_C` (35 °C) in an off slot. `DHW_OFF_MODE=auto` reverts to the legacy behaviour where off slots only clear forced mode and the Ecodan reheats on its own schedule. Slots already executed today count against the daily minimum/maximum, so a mid-day re-plan cannot schedule a fresh full quota.
 
 **Self-correcting** — the optimizer re-runs every 5 minutes with the live battery state of charge, so it continuously adapts to what actually happened (cloud cover, unexpected load, etc.).
 
@@ -23,7 +23,7 @@ Runs every 5 minutes via cron. Each tick it re-optimizes the remaining half-hour
 | Inverter | GivEnergy (local Modbus TCP, firmware 912+ / battery firmware 3015+) |
 | Battery | 9.5 kWh, 93% round-trip efficiency; measured sustained ≈3.4 kW charge / ≈2.8 kW discharge (`BATTERY_MAX_CHARGE_KW` / `BATTERY_MAX_DISCHARGE_KW`) |
 | Solar | Roof PV — forecast via Solcast |
-| Tariff | Octopus Agile (half-hourly buy and sell prices) |
+| Tariff | Octopus Agile or Cosy import (banded rates are expanded to half-hours) + Agile Outgoing export |
 | Heat pump | Mitsubishi Ecodan (DHW only, via MELCloud API) |
 | Weather | Open-Meteo (free, no API key) |
 
@@ -46,14 +46,22 @@ Every tick refreshes data feeds with TTL-aware caching to avoid unnecessary API 
 A temperature-adjusted baseline model is fitted from historical consumption:
 
 ```
-predicted_load[t] = baseline[day_type][slot_index] + α × (temp[t] − ref_temp)
+predicted_load[t] = baseline[day_type][slot_index] + α × max(0, hdd_base − temp[t])
 ```
 
 - `day_type` is one of `weekday`, `weekend`, `holiday` (UK England public holidays)
 - `slot_index` is 0–47, the half-hour position within the UK local day
-- `α` is an OLS-fitted temperature coefficient (kWh per °C)
+- `α` is a least-squares heating-degree coefficient (kWh per °C below `hdd_base`, default 13 °C via `LOAD_MODEL_HDD_BASE_C`,
+  so cold slots add load and warm ones add nothing). Set `LOAD_MODEL_HDD_BASE_C=`
+  (empty) for the legacy linear form `α × (temp − ref_temp)`
+- The fit is recency-weighted: each slot's weight halves every
+  `LOAD_MODEL_HALF_LIFE_DAYS` (default 10; `0` = unweighted) over a
+  `LOAD_MODEL_DAYS` window (default 56), so the baseline follows the season
+- Holidays borrow the weekend baseline when the window holds < 1 weighted holiday
 - Falls back to a baseline-only model (α = 0) when historical weather coverage is insufficient
 - A minimum floor of 0.2 kWh/slot is applied to account for always-on base load
+- `octoopt2-backtest --replay --replay-load model [--load-half-life N --load-hdd-base T]`
+  re-fits the model walk-forward on a DB copy to compare settings
 
 ### Optimization
 
@@ -114,7 +122,7 @@ period:
 
 ```bash
 sudo systemctl disable --now octoopt2-daemon   # stop AND disable, so a reboot doesn't resurrect it
-uv run octoopt2-away --reserve 20              # inverter → ECO + 20% reserve floor, DHW → auto
+uv run octoopt2-away --reserve 20              # inverter → ECO + 20% reserve floor, DHW → auto at normal target
 ```
 
 The command verifies each register after writing and refuses to run (exit 3) if
@@ -125,7 +133,7 @@ the away state on its next tick. Flags: `--reserve N` (default 20), `--no-dhw`,
 To confirm everything is (still) set correctly — before leaving, or later over
 SSH — run the read-only check; it writes nothing and prints PASS/FAIL for each
 condition (daemon stopped, ECO on, forced discharge off, both reserve registers,
-DHW auto), exiting 0 only when all pass:
+DHW auto at `DHW_TARGET_C`), exiting 0 only when all pass:
 
 ```bash
 uv run octoopt2-away --check                # expects the default 20% reserve
@@ -133,14 +141,36 @@ uv run octoopt2-away --check --reserve 30   # if you applied a different floor
 ```
 
 In ECO mode the battery self-consumes solar and never force-imports or
-force-exports. The Ecodan in `auto` follows its own onboard schedule; for a long
-absence consider also setting MELCloud's holiday mode with your return date.
+force-exports. The Ecodan in `auto` at its normal target follows its own onboard
+schedule (any target held low for an off slot is restored); for a long absence
+consider also setting MELCloud's holiday mode with your return date.
 
-As a backstop, the daemon applies the same safe state (ECO + DHW auto) on every
+As a backstop, the daemon applies the same safe state (ECO + DHW released) on every
 shutdown — a `systemctl stop`, host reboot, or crash-exit lands the hardware in
 ECO rather than a stuck force-charge/force-export window. This fallback restores
 the default 4% reserve, not a custom floor — hence the explicit `octoopt2-away`
 step above.
+
+### Axle Energy events (optional)
+
+[Axle](https://vpp.axle.energy/) pays per kWh of metered export during short grid
+events (3–6 a month, notified a day ahead) and sends its own export command to the
+inverter through the GivEnergy cloud. In Axle's *Events Only* mode octoopt2 keeps
+control the rest of the time. Set `AXLE_TOKEN` (Account Settings → Home Assistant
+in the Axle app) and the daemon:
+
+- polls Axle's next-event endpoint on the slow path and stores it in `axle_events`;
+- adds the payment (`AXLE_EXPORT_GBP_KWH`, default £1/kWh) to the sell price of the
+  event's slots when optimizing, so the plan fills the battery beforehand and exports
+  at full power through it (`schedule.axle_uplift_gbp_kwh` records the uplift; the
+  stored buy/sell prices stay the real tariff);
+- holds `DISCHARGE_EXPORT` at max power for the whole event (`CHARGE` for an import
+  event), logged with trigger `axle`, so its writes and Axle's agree. The register
+  drift check re-asserts the mode if anything else changes it;
+- shows the next/active event on the status page.
+
+`octoopt2-backtest --axle-events events.json` applies the same uplift to every
+strategy so the value of past events can be measured.
 
 ### Persistence
 
@@ -148,7 +178,7 @@ All data is stored in a local SQLite database (WAL mode). Tables:
 
 | Table | Contents |
 |-------|----------|
-| `prices` | Half-hourly Agile buy/sell rates |
+| `prices` | Half-hourly buy/sell rates (banded import tariffs expanded) |
 | `consumption` | Octopus smart meter half-hourly net grid import |
 | `solar_forecast` | Solcast p10/p50/p90 per slot |
 | `solar_actuals` | Solcast tuned actuals (retrospective) |
@@ -167,7 +197,7 @@ All data is stored in a local SQLite database (WAL mode). Tables:
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) for dependency management
 - GivEnergy inverter reachable on local network (Modbus TCP port 8899)
-- Octopus Energy account on Agile tariff with API access
+- Octopus Energy account on Agile or Cosy import (any product with published unit rates) with API access
 - Solcast account with a rooftop site configured
 - MELCloud account (only required if using DHW scheduling)
 
@@ -195,14 +225,19 @@ Required environment variables:
 | `OCTOPUS_ACCOUNT_NUMBER` | Octopus account number |
 | `OCTOPUS_MPAN` | Electricity meter MPAN |
 | `OCTOPUS_SERIAL` | Electricity meter serial number |
-| `OCTOPUS_AGILE_TARIFF_CODE` | Full Agile buy tariff code (e.g. `E-1R-AGILE-24-10-01-C`) |
-| `OCTOPUS_OUTGOING_TARIFF_CODE` | Full Agile export tariff code |
+| `OCTOPUS_IMPORT_TARIFF_CODE` | Full import (buy) tariff code, e.g. `E-1R-AGILE-24-10-01-C` or `E-1R-COSY-22-12-08-G`; the product code is derived from it (`OCTOPUS_AGILE_TARIFF_CODE` still works, with a deprecation warning) |
+| `OCTOPUS_OUTGOING_TARIFF_CODE` | Full export (sell) tariff code, normally Agile Outgoing |
 | `OCTOPUS_DNO_REGION` | DNO region letter (e.g. `C` for London) |
 | `SOLCAST_API_KEY` | Solcast API key |
 | `SOLCAST_RESOURCE_ID` | Solcast rooftop site resource ID |
 | `MELCLOUD_EMAIL` | MELCloud account email |
 | `MELCLOUD_PASSWORD` | MELCloud account password |
 | `MELCLOUD_DEVICE_ID` | MELCloud device ID (found during setup) |
+| `DHW_MIN_SLOTS_PER_DAY` / `DHW_MAX_SLOTS_PER_DAY` | Daily DHW slot quota (default 4 / 8) |
+| `DHW_OFF_MODE` | `setpoint` (default: hold tank target low outside planned slots) or `auto` (legacy: Ecodan reheats on its own) |
+| `DHW_TARGET_C` | Normal tank target, °C (default 50) — written in planned slots and on release |
+| `DHW_OFF_TARGET_C` | Target held in off slots, °C (default 40, MELCloud's minimum) |
+| `DHW_MIN_TANK_C` | Comfort guard floor, °C (default 35; 0 disables) — below this in an off slot the normal target is restored |
 | `LATITUDE` | Home latitude |
 | `LONGITUDE` | Home longitude |
 
@@ -244,7 +279,7 @@ Flags: `--no-dhw` (see below), `--output` (write `web/schedule.json` each tick),
 
 Supervise it however you like (systemd, tmux, `nohup`, a container). It logs to
 stdout and shuts down cleanly on SIGINT/SIGTERM. On shutdown it applies a safe
-fallback — inverter → ECO, DHW → auto (skipped under `--dry-run`, DHW part
+fallback — inverter → ECO, DHW → auto at `DHW_TARGET_C` (skipped under `--dry-run`, DHW part
 skipped under `--no-dhw`) — so a stop or reboot never strands the inverter in a
 force-charge/force-export window. Worst case this takes ~60 s against an
 unreachable inverter, so if you run it under systemd keep `TimeoutStopSec` at
@@ -344,7 +379,7 @@ To run without active DHW scheduling (Ecodan stays in its own auto mode):
 uv run octoopt2 --no-dhw
 ```
 
-This still controls the battery normally. On each tick it sends an `auto` command to MELCloud so the heat pump falls back to its internal schedule.
+This still controls the battery normally. On each slot boundary it releases the Ecodan — `auto` mode at `DHW_TARGET_C` — so the heat pump falls back to its internal schedule at its normal target.
 
 ---
 
@@ -422,7 +457,8 @@ octoopt2/
   scheduler.py               — main optimization loop (called every 5 min)
   main.py                    — CLI entry point
   data/
-    octopus.py               — Agile prices and consumption from Octopus API
+    octopus.py               — import/export prices and consumption from Octopus API
+    rates.py                 — rate record parsing and band→half-hour expansion
     solcast.py               — solar forecast and actuals from Solcast
     weather.py               — weather forecast + historical backfill from Open-Meteo
     inverter.py              — live inverter readings via Modbus TCP

@@ -16,7 +16,12 @@ Register-write optimisations
 ─────────────────────────────
 1. Skip write entirely when mode and power level are unchanged since the last
    successful write. This avoids hammering flash registers every 5-minute tick
-   when the inverter is already in the correct state.
+   when the inverter is already in the correct state. The skip is overridden
+   when a register reading taken *after* that write shows the inverter no
+   longer agrees (a fallback left the reserve at 4%, the app or a third party
+   such as Axle changed a schedule): the command is re-asserted once, with
+   trigger "<trigger>+drift". Only readings newer than the last write count,
+   so a stale snapshot can never cause a write loop.
 
 2. Slot-time registers (CHARGE_SLOT_1 / DISCHARGE_SLOT_1) are only written on
    mode transitions — they are set once when entering a mode and then left alone
@@ -30,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timezone
 
 from ..config import BatteryConfig, GivEnergyConfig
+from ..data.inverter import InverterReading, get_latest_reading
 from ..db import get_conn
 from ..givenergy_modbus_async.client.client import Client
 from ..givenergy_modbus_async.model import TimeSlot
@@ -50,16 +56,66 @@ _RETRY_DELAY_S = 2
 class _LastCommand:
     mode: str           # CHARGE | DISCHARGE_EXPORT | ECO
     power_register: int # 1-50 for CHARGE/DISCHARGE; 0 for ECO
+    applied_at: datetime | None = None  # UTC; when the registers were last written
+    trigger: str | None = None          # what caused the write (…"+drift" = a re-assert)
 
 
 def _load_last_command(db_path: str) -> _LastCommand | None:
     with get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT mode, power_register FROM inverter_last_command WHERE id = 1"
+            "SELECT mode, power_register, applied_at, trigger FROM inverter_last_command WHERE id = 1"
         ).fetchone()
     if row is None:
         return None
-    return _LastCommand(mode=row["mode"], power_register=row["power_register"])
+    applied = datetime.fromisoformat(row["applied_at"]) if row["applied_at"] else None
+    if applied is not None and applied.tzinfo is None:
+        applied = applied.replace(tzinfo=timezone.utc)
+    return _LastCommand(mode=row["mode"], power_register=row["power_register"],
+                        applied_at=applied, trigger=row["trigger"])
+
+
+# ── Register-truth check ──────────────────────────────────────────────────────
+
+# Enable-type registers (charge/discharge enables and eco mode share the Enable
+# enum) read back 0/1; anything else maps to 3 = "unknown" on some firmware.
+_ENABLE_KEYS = ("enable_charge", "enable_discharge", "eco_mode")
+_ENABLE_KNOWN = {0, 1}
+_DRIFT_SUFFIX = "+drift"
+
+
+def registers_consistent(
+    mode: str, power_reg: int, reading: InverterReading | None, hw_reserve_pct: int
+) -> bool | None:
+    """Does a register snapshot agree with the mode we believe we set?
+
+    Returns True/False, or None when the snapshot cannot tell (no reading, or
+    any checked register missing / unknown). Only registers that the mode's
+    command list writes are checked.
+    """
+    if reading is None:
+        return None
+    hr = {
+        "enable_charge": reading.hr_enable_charge,
+        "enable_discharge": reading.hr_enable_discharge,
+        "soc_reserve": reading.hr_soc_reserve,
+        "power_reserve": reading.hr_power_reserve,
+        "charge_limit": reading.hr_charge_limit,
+        "discharge_limit": reading.hr_discharge_limit,
+        "eco_mode": reading.hr_eco_mode,
+    }
+    if mode == "CHARGE":
+        expect = {"enable_charge": 1, "enable_discharge": 0, "charge_limit": power_reg}
+    elif mode == "DISCHARGE_EXPORT":
+        expect = {"enable_discharge": 1, "enable_charge": 0, "eco_mode": 0,
+                  "discharge_limit": power_reg}
+    else:
+        expect = {"eco_mode": 1, "enable_charge": 0, "enable_discharge": 0,
+                  "soc_reserve": hw_reserve_pct, "power_reserve": hw_reserve_pct}
+    for key, want in expect.items():
+        got = hr[key]
+        if got is None or (key in _ENABLE_KEYS and got not in _ENABLE_KNOWN):
+            return None
+    return all(hr[key] == want for key, want in expect.items())
 
 
 def _save_last_command(db_path: str, cmd: _LastCommand, write_count: int) -> int:
@@ -70,15 +126,17 @@ def _save_last_command(db_path: str, cmd: _LastCommand, write_count: int) -> int
     with get_conn(db_path) as conn:
         conn.execute(
             """
-            INSERT INTO inverter_last_command (id, applied_at, mode, power_register, total_writes)
-            VALUES (1, ?, ?, ?, ?)
+            INSERT INTO inverter_last_command (id, applied_at, mode, power_register, total_writes, trigger)
+            VALUES (1, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 applied_at     = excluded.applied_at,
                 mode           = excluded.mode,
                 power_register = excluded.power_register,
-                total_writes   = inverter_last_command.total_writes + excluded.total_writes
+                total_writes   = inverter_last_command.total_writes + excluded.total_writes,
+                trigger        = excluded.trigger
             """,
-            (datetime.now(timezone.utc).isoformat(), cmd.mode, cmd.power_register, write_count),
+            (datetime.now(timezone.utc).isoformat(), cmd.mode, cmd.power_register, write_count,
+             cmd.trigger),
         )
         row = conn.execute(
             "SELECT total_writes FROM inverter_last_command WHERE id = 1"
@@ -152,11 +210,19 @@ def apply_decision(
     battery: BatteryConfig,
     db_path: str,
     trigger: str | None = None,
+    reading: InverterReading | None = None,
 ) -> None:
     """Translate a slot decision into inverter register writes.
 
-    Skips the write entirely if mode and power level are unchanged.
-    Only writes slot-time registers when the mode actually changes.
+    Skips the write entirely if mode and power level are unchanged — unless a
+    register snapshot newer than the last write (``reading``, or the latest
+    stored reading when not given) shows the inverter has drifted, in which
+    case the full command (slot-time registers included, since a third party
+    may have narrowed the window) is re-asserted **once**: a command whose last
+    write was already a drift re-assert is not written again while the plan
+    keeps asking for the same thing, so a register another controller insists
+    on (or the firmware clamps) cannot start a write tug-of-war. Otherwise
+    slot-time registers are only written when the mode actually changes.
     """
     mode, power_kw = decision_to_mode(decision, battery)
     if mode == "CHARGE":
@@ -166,15 +232,37 @@ def apply_decision(
     else:
         power_reg = 0
 
-    # ── Skip if unchanged ─────────────────────────────────────────────────
+    # ── Skip if unchanged (and the inverter still agrees) ─────────────────
     last = _load_last_command(db_path)
-    if last is not None and last.mode == mode and last.power_register == power_reg:
-        logger.debug(
-            "Inverter command unchanged (%s reg=%d) — skipping write", mode, power_reg
-        )
-        return
-
     last_mode = last.mode if last is not None else None
+    if last is not None and last.mode == mode and last.power_register == power_reg:
+        if reading is None:
+            reading = get_latest_reading(db_path)
+        fresh = (
+            reading is not None
+            and last.applied_at is not None
+            and reading.recorded_at > last.applied_at
+        )
+        drifted = fresh and registers_consistent(
+            mode, power_reg, reading, battery.hw_reserve_pct
+        ) is False
+        if not drifted:
+            logger.debug(
+                "Inverter command unchanged (%s reg=%d) — skipping write", mode, power_reg
+            )
+            return
+        if last.trigger and last.trigger.endswith(_DRIFT_SUFFIX):
+            logger.info(
+                "Inverter registers still disagree with %s reg=%d after a drift re-assert — "
+                "not writing again until the plan changes", mode, power_reg,
+            )
+            return
+        logger.warning(
+            "Inverter registers drifted from last command (%s reg=%d) — re-asserting",
+            mode, power_reg,
+        )
+        trigger = f"{trigger or 'tick'}{_DRIFT_SUFFIX}"
+        last_mode = None   # rewrite the slot windows too; they are not in the check
 
     # ── Build command list ────────────────────────────────────────────────
     if mode == "CHARGE":
@@ -191,7 +279,9 @@ def apply_decision(
         _log_command(db_path, mode=mode, power_register=power_reg, n_writes=len(reqs),
                      ok=False, error=str(exc), slot_start=decision.slot_start, trigger=trigger)
         raise
-    total = _save_last_command(db_path, _LastCommand(mode=mode, power_register=power_reg), len(reqs))
+    total = _save_last_command(
+        db_path, _LastCommand(mode=mode, power_register=power_reg, trigger=trigger), len(reqs)
+    )
     _log_command(db_path, mode=mode, power_register=power_reg, n_writes=len(reqs),
                  ok=True, slot_start=decision.slot_start, trigger=trigger)
     logger.info(
@@ -230,6 +320,7 @@ def set_eco_mode(
     db_path: str,
     reserve_pct: int | None = None,
     skip_if_current: bool = False,
+    trigger: str = "fallback",
 ) -> int:
     """Put the inverter in ECO (dynamic self-consumption). Returns writes sent.
 
@@ -254,10 +345,10 @@ def set_eco_mode(
         _run_with_retry(config, reqs)
     except Exception as exc:
         _log_command(db_path, mode="ECO", power_register=0, n_writes=len(reqs),
-                     ok=False, error=str(exc), trigger="fallback")
+                     ok=False, error=str(exc), trigger=trigger)
         raise
-    total = _save_last_command(db_path, _LastCommand(mode="ECO", power_register=0), len(reqs))
-    _log_command(db_path, mode="ECO", power_register=0, n_writes=len(reqs), ok=True, trigger="fallback")
+    total = _save_last_command(db_path, _LastCommand(mode="ECO", power_register=0, trigger=trigger), len(reqs))
+    _log_command(db_path, mode="ECO", power_register=0, n_writes=len(reqs), ok=True, trigger=trigger)
     logger.info("Inverter: ECO applied — %d register write(s) sent, lifetime total %d", len(reqs), total)
     return len(reqs)
 

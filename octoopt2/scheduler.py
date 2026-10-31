@@ -25,8 +25,9 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from .config import AppConfig
-from .control.ecodan import read_and_store_dhw_state, set_dhw
+from .control.ecodan import apply_dhw, dhw_command, read_and_store_dhw_state, release_command, release_dhw
 from .control.inverter import apply_decision
+from .data.axle import AxleAuthError, AxleEvent, active_event, fetch_and_store_axle, get_events, slot_uplift
 from .data.consumption import fetch_and_store_consumption
 from .data.inverter import get_latest_reading, read_and_store
 from .data.octopus import (
@@ -39,7 +40,7 @@ from .data.solcast import fetch_and_store_actuals, fetch_and_store_forecast, get
 from .data.weather import backfill_weather_history, fetch_and_store_weather, get_temperature_forecast
 from .db import get_conn, record_fetch
 from .optimizer.forecast import fit_load_model, get_temperature_per_slot
-from .optimizer.model import OptimizerInput, optimize
+from .optimizer.model import OptimizerInput, SlotDecision, optimize
 from .optimizer.schedule import get_current_decision, record_optimizer_run, save_schedule
 
 logger = logging.getLogger(__name__)
@@ -85,9 +86,13 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     saved_decision = None
     if not dry_run:
         saved_decision = get_current_decision(config.db_path, now=now)
-        if saved_decision is not None:
+        # An active Axle event overrides the plan with max export (or charge)
+        # so our writes agree with Axle's own cloud command.
+        held, event = _axle_hold(config, saved_decision, now)
+        if held is not None:
             try:
-                apply_decision(saved_decision, config.givenergy, config.battery, config.db_path, trigger="fast")
+                apply_decision(held, config.givenergy, config.battery, config.db_path,
+                               trigger="axle" if event else "fast", reading=reading)
             except Exception as exc:
                 logger.error("Failed to apply inverter decision: %s", exc)
 
@@ -111,12 +116,14 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
     _refresh_feeds(config, now)
 
     # ── 4b. Log ground-truth DHW tank state (best-effort) ──────────────────
-    # One MELCloud read per slot boundary; failures are logged, not fatal.
+    # One MELCloud read per slot boundary; failures are logged, not fatal. The
+    # tank temperature also feeds the comfort guard in step 9.
+    dhw_state = None
     if not dry_run:
-        read_and_store_dhw_state(config.melcloud, config.db_path)
+        dhw_state = read_and_store_dhw_state(config.melcloud, config.db_path)
 
     # ── 5. Fit load model ─────────────────────────────────────────────────
-    load_model = fit_load_model(config.db_path)
+    load_model = fit_load_model(config.db_path, config.load_model, now=now)
     if load_model is None:
         logger.warning(
             "Load model unavailable — using fallback %.2f kWh/slot", _FALLBACK_LOAD_KWH
@@ -130,6 +137,9 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         "beta": load_model.dhw_kwh_per_slot if load_model else None,
         "ref_temp": load_model.ref_temp if load_model else None,
         "n_train_slots": load_model.n_slots if load_model else None,
+        "half_life_days": config.load_model.half_life_days,
+        "hdd_base_c": config.load_model.hdd_base_c,
+        "train_days": config.load_model.train_days,
         "manage_dhw": manage_dhw,
         "soc_start_kwh": initial_soc_kwh,
     }
@@ -189,6 +199,16 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         else:
             load_forecast.append(_FALLBACK_LOAD_KWH)
 
+    axle_uplift = None
+    if config.axle.enabled:
+        events = get_events(config.db_path, slot_starts[0], slot_starts[-1] + timedelta(minutes=30))
+        if events:
+            axle_uplift = slot_uplift(events, slot_starts, config.axle)
+            logger.info(
+                "Axle: %d event(s) in horizon — price uplift on %d slot(s)",
+                len(events), sum(1 for u in axle_uplift if u),
+            )
+
     inputs = OptimizerInput(
         slot_starts=slot_starts,
         initial_soc_kwh=initial_soc_kwh,
@@ -196,14 +216,19 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         sell_prices=sell_prices,
         solar_forecast=solar_forecast,
         load_forecast=load_forecast,
+        axle_uplift=axle_uplift,
     )
 
     # ── 7. Optimize ────────────────────────────────────────────────────────
+    # DHW slots already executed today count against today's min/max, or every
+    # re-run would plan a fresh full quota into the remaining slots.
+    dhw_done = _dhw_slots_done_today(config.db_path, now) if manage_dhw else None
     try:
         result = optimize(
             inputs, config.battery, config.dhw, config.givenergy,
             manage_dhw=manage_dhw,
             dhw_kwh_per_slot=load_model.dhw_kwh_per_slot if load_model else None,
+            dhw_done_today=dhw_done,
         )
         logger.info(
             "Optimization complete: status=%s total_cost=£%.4f",
@@ -262,13 +287,19 @@ def run(config: AppConfig, dry_run: bool = False, manage_dhw: bool = True, outpu
         decision.dhw_on,
     )
 
+    held, event = _axle_hold(config, decision, now)
     try:
-        apply_decision(decision, config.givenergy, config.battery, config.db_path, trigger="slow")
+        apply_decision(held, config.givenergy, config.battery, config.db_path,
+                       trigger="axle" if event else "slow", reading=reading)
     except Exception as exc:
         logger.error("Failed to apply inverter decision: %s", exc)
 
     try:
-        set_dhw(config.melcloud, decision.dhw_on if manage_dhw else False)
+        if manage_dhw:
+            tank_c = dhw_state.get("tank_temperature") if dhw_state else None
+            apply_dhw(config.melcloud, dhw_command(decision.dhw_on, tank_c, config.dhw))
+        else:
+            apply_dhw(config.melcloud, release_command(config.dhw))
     except Exception as exc:
         logger.error("Failed to apply DHW decision: %s", exc)
 
@@ -291,7 +322,7 @@ def _print_dry_run(result, inputs, now: datetime, config: AppConfig, manage_dhw:
     print(f"  Solver status: {result.solver_status}")
     print(f"  Total cost   : £{result.total_cost_gbp:.4f}")
     print(f"  Slots        : {len(result.decisions)}")
-    print(f"  DHW control  : {'managed by optimizer' if manage_dhw else 'disabled (auto)'}")
+    print(f"  DHW control  : {_dhw_control_label(config, manage_dhw)}")
     print("=" * 100)
 
     # Column header
@@ -380,10 +411,22 @@ def _print_dry_run(result, inputs, now: datetime, config: AppConfig, manage_dhw:
         else:
             print(f"    Inverter : ECO — set_mode_dynamic()")
         if manage_dhw:
-            print(f"    Ecodan   : DHW {'force_hot_water' if d.dhw_on else 'auto (off)'}")
+            cmd = dhw_command(d.dhw_on, None, config.dhw)
+            print(f"    Ecodan   : DHW {'ON' if d.dhw_on else 'off'} → {cmd.describe()}")
         else:
-            print(f"    Ecodan   : DHW unmanaged (auto)")
+            print(f"    Ecodan   : DHW unmanaged → {release_command(config.dhw).describe()}")
     print()
+
+
+def _dhw_control_label(config: AppConfig, manage_dhw: bool) -> str:
+    if not manage_dhw:
+        return "disabled (auto)"
+    if config.dhw.off_mode == "auto":
+        return "managed by optimizer (off slots: auto — Ecodan may still reheat)"
+    return (
+        f"managed by optimizer (off slots: target held at {config.dhw.off_target_c:g}°C, "
+        f"ON: forced to {config.dhw.target_c:g}°C)"
+    )
 
 
 # ── Web output ───────────────────────────────────────────────────────────────
@@ -476,6 +519,9 @@ def _write_web_output(result, inputs, now: datetime, config: AppConfig, manage_d
         "solver_status":  result.solver_status,
         "total_cost_gbp": round(result.total_cost_gbp, 4),
         "manage_dhw":     manage_dhw,
+        "dhw_off_mode":   config.dhw.off_mode,
+        "dhw_target_c":   config.dhw.target_c,
+        "dhw_off_target_c": config.dhw.off_target_c,
         "battery_capacity_kwh": config.battery.capacity_kwh,
         "schedule":       slots,
         "yesterday":      yesterday_summary,
@@ -544,6 +590,16 @@ def _refresh_feeds(config: AppConfig, now: datetime) -> None:
     except Exception as exc:
         logger.warning("Solcast forecast fetch failed: %s", exc)
 
+    # Axle VPP next event (only when AXLE_TOKEN is set). Events are notified a
+    # day ahead, so the 30-min slow-path cadence is plenty.
+    if config.axle.enabled:
+        try:
+            fetch_and_store_axle(config.axle, config.db_path, now=now)
+        except AxleAuthError as exc:
+            logger.error("Axle: %s — regenerate AXLE_TOKEN", exc)
+        except Exception as exc:
+            logger.warning("Axle event fetch failed: %s", exc)
+
     # Solcast actuals (24h TTL — skips if fresh)
     try:
         fetch_and_store_actuals(config.solcast, config.db_path)
@@ -581,8 +637,11 @@ def _last_published_sell(db_path: str, before: datetime) -> float | None:
 def _remaining_slots(db_path: str, now: datetime) -> list[datetime]:
     """Return upcoming 30-min slots that have price data.
 
-    Starts from the slot containing now, ends at the last slot with
-    price data in the DB (typically 23:00 UK time tomorrow).
+    Starts from the slot containing now, ends at the last slot with buy price
+    data in the DB, capped at 48 h: typically 23:00 UK time tomorrow on Agile,
+    the full 48 h on a banded tariff such as Cosy (rates are published months
+    ahead). Slots whose Outgoing rate is not yet published get the pessimistic
+    ``min(buy, last published sell)`` fallback in ``run``.
     """
     # Round down to current slot boundary
     current_slot = now.replace(
@@ -597,24 +656,101 @@ def _remaining_slots(db_path: str, now: datetime) -> list[datetime]:
     return [p["slot_start"].astimezone(timezone.utc) for p in prices]
 
 
-def _apply_safe_fallback(config: AppConfig, *, manage_dhw: bool = True, dry_run: bool = False) -> None:
-    """Apply a safe state when the optimizer cannot run: eco mode, DHW auto.
+def _dhw_slots_done_today(db_path: str, now: datetime) -> dict[date, int]:
+    """Planned-ON DHW slots already executed today, keyed by UK date.
 
-    Best-effort — never raises. Also used as the daemon's shutdown fallback.
+    `schedule` keeps the last plan for each slot, and the last plan covering a
+    past slot is the one solved at that slot's boundary — i.e. the decision that
+    was actually sent to the Ecodan. Counting those from UK midnight up to (but
+    excluding) the current slot gives the quota already used, which optimize()
+    subtracts from today's min/max.
+    """
+    current_slot = now.replace(minute=(now.minute // 30) * 30, second=0, microsecond=0)
+    local_midnight = current_slot.astimezone(LONDON).replace(hour=0, minute=0, second=0, microsecond=0)
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM schedule WHERE dhw_on = 1 AND slot_start >= ? AND slot_start < ?",
+            (local_midnight.astimezone(timezone.utc).isoformat(),
+             current_slot.astimezone(timezone.utc).isoformat()),
+        ).fetchone()
+    done = int(row["n"]) if row else 0
+    return {local_midnight.date(): done} if done else {}
+
+
+def _axle_event_decision(config: AppConfig, event: AxleEvent, now: datetime) -> SlotDecision:
+    """Synthetic slot decision for an active Axle event: max export for an
+    export event (→ DISCHARGE_EXPORT at register 50), max grid charge for an
+    import event (→ CHARGE at register 50)."""
+    slot = now.replace(minute=(now.minute // 30) * 30, second=0, microsecond=0)
+    if event.direction == "import":
+        kwh = config.battery.max_charge_rate_kw * 0.5
+        return SlotDecision(slot_start=slot, battery_charge_kwh=kwh, battery_discharge_kwh=0.0,
+                            grid_import_kwh=kwh, grid_export_kwh=0.0, dhw_on=False,
+                            soc_start_kwh=0.0, soc_end_kwh=0.0, slot_cost_gbp=0.0)
+    dis = config.battery.max_discharge_rate_kw * 0.5
+    return SlotDecision(slot_start=slot, battery_charge_kwh=0.0, battery_discharge_kwh=dis,
+                        grid_import_kwh=0.0, grid_export_kwh=config.givenergy.max_export_kw * 0.5,
+                        dhw_on=False, soc_start_kwh=0.0, soc_end_kwh=0.0, slot_cost_gbp=0.0)
+
+
+def _axle_hold(
+    config: AppConfig, decision: SlotDecision | None, now: datetime
+) -> tuple[SlotDecision | None, AxleEvent | None]:
+    """Return the decision to apply now and the active Axle event, if any.
+
+    Outside an event (or with Axle disabled) the saved decision is returned
+    unchanged. During an event the plan is replaced by the event decision —
+    even when no plan is saved — so the controller never writes ECO/CHARGE
+    against Axle's export command.
+    """
+    if not config.axle.enabled:
+        return decision, None
+    try:
+        event = active_event(config.db_path, now, config.axle.hold_margin_minutes)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Axle event lookup failed: %s", exc)
+        return decision, None
+    if event is None:
+        return decision, None
+    logger.info("Axle %s event active (%s → %s) — holding event mode", event.direction,
+                event.start.isoformat(timespec="minutes"), event.end.isoformat(timespec="minutes"))
+    return _axle_event_decision(config, event, now), event
+
+
+def _apply_safe_fallback(
+    config: AppConfig, *, manage_dhw: bool = True, dry_run: bool = False, allow_axle_hold: bool = True
+) -> None:
+    """Apply a safe state when the optimizer cannot run: eco mode, DHW released.
+
+    "Released" = auto mode at the normal tank target, so a target lowered for an
+    off slot never outlives the controller. Best-effort — never raises. Also
+    used as the daemon's shutdown fallback (with allow_axle_hold=False: a process
+    that is exiting cannot end an event hold, so it leaves ECO).
     """
     if dry_run:
         logger.info("Dry-run — skipping safe fallback hardware writes")
         return
-    logger.info("Applying safe fallback: eco mode, DHW auto")
-    try:
-        from .control.inverter import set_eco_mode
-        set_eco_mode(config.givenergy, config.db_path, skip_if_current=True)
-    except Exception as exc:
-        logger.error("Safe fallback inverter command failed: %s", exc)
+    held, event = (None, None)
+    if allow_axle_hold:
+        held, event = _axle_hold(config, None, datetime.now(timezone.utc))
+    if held is not None:
+        logger.info("Safe fallback during Axle %s event: keeping event mode, DHW %s",
+                    event.direction, release_command(config.dhw).describe())
+        try:
+            apply_decision(held, config.givenergy, config.battery, config.db_path, trigger="axle")
+        except Exception as exc:
+            logger.error("Safe fallback inverter command failed: %s", exc)
+    else:
+        logger.info("Applying safe fallback: eco mode, DHW %s", release_command(config.dhw).describe())
+        try:
+            from .control.inverter import set_eco_mode
+            set_eco_mode(config.givenergy, config.db_path, skip_if_current=True)
+        except Exception as exc:
+            logger.error("Safe fallback inverter command failed: %s", exc)
 
     if manage_dhw:
         try:
-            set_dhw(config.melcloud, enabled=False)
+            release_dhw(config.melcloud, config.dhw)
         except Exception as exc:
             logger.error("Safe fallback DHW command failed: %s", exc)
 

@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
 from ..config import BatteryConfig, DhwConfig, GivEnergyConfig
-from .data import Segment, Slot
+from .data import LONDON, Segment, Slot
 from .hindsight import run_hindsight
 from .replay import RollingOptions, planned_modes, run_planned_executed, run_rolling_replay
 from .simulate import SimFlow, SimLimits, run_eco, run_no_battery
@@ -199,6 +199,15 @@ def forecast_accuracy(slots: list[Slot]) -> dict:
             if s.pred_load_kwh is not None and s.load_kwh is not None:
                 byh[s.slot_start.astimezone(timezone.utc).hour].append((s.pred_load_kwh, s.load_kwh))
         out["load_by_hour_utc"] = {h: round(sum(abs(p - a) for p, a in v) / len(v), 4) for h, v in sorted(byh.items())}
+        byl: dict[int, list] = defaultdict(list)
+        for s in slots:
+            if s.pred_load_kwh is not None and s.load_kwh is not None:
+                byl[s.slot_start.astimezone(LONDON).hour].append((s.pred_load_kwh, s.load_kwh))
+        out["load_by_hour_local"] = {
+            h: {"mae": round(sum(abs(p - a) for p, a in v) / len(v), 4),
+                "bias": round(sum(p - a for p, a in v) / len(v), 4), "n": len(v)}
+            for h, v in sorted(byl.items())
+        }
     return out
 
 

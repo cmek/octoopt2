@@ -18,7 +18,8 @@ Three concurrent loops:
                     into shared in-memory state and, since the load model and
                     per-slot actuals are built from it, into inverter_readings.
   ecodan poller   — every ECODAN_POLL_SECONDS, MELCloud DHW read into state and
-                    dhw_readings.
+                    dhw_readings; also runs the DHW comfort guard (restores the
+                    normal tank target when an off slot has left the tank cold).
   optimizer tick  — every 5 min (wall-clock aligned), lock-guarded scheduler.run()
                     in a worker thread — the existing fast/slow path, unchanged.
 
@@ -41,7 +42,13 @@ from pathlib import Path
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 
 from .config import AppConfig
-from .control.ecodan import _get_dhw_state_async, store_dhw_state
+from .control.ecodan import (
+    _get_dhw_state_async,
+    apply_dhw_async,
+    guard_active,
+    release_command,
+    store_dhw_state,
+)
 from .data.inverter import InverterReading, read_inverter, store_reading
 from .db import init_db
 from .metrics import OctooptCollector
@@ -125,7 +132,8 @@ def _make_handler(state: "DaemonState", config: AppConfig):
             if path == "/status.json":
                 try:
                     payload = build_status(
-                        state, config.db_path, config.battery.capacity_kwh
+                        state, config.db_path, config.battery.capacity_kwh, dhw_cfg=config.dhw,
+                        axle_cfg=config.axle,
                     )
                     body = json.dumps(payload).encode()
                     self._send(200, "application/json", body, cache=False)
@@ -193,14 +201,26 @@ async def _poll_inverter_loop(config: AppConfig, state: DaemonState) -> None:
         await asyncio.sleep(period)
 
 
-async def _poll_ecodan_loop(config: AppConfig, state: DaemonState) -> None:
-    """Poll MELCloud for DHW tank state every ECODAN_POLL_SECONDS."""
+async def _poll_ecodan_loop(
+    config: AppConfig, state: DaemonState, manage_dhw: bool = True, dry_run: bool = False
+) -> None:
+    """Poll MELCloud for DHW tank state every ECODAN_POLL_SECONDS.
+
+    Also the comfort guard: when the optimizer is holding the tank target low
+    for an off slot and the tank has fallen below DHW_MIN_TANK_C, hand the
+    Ecodan its normal target back right away rather than waiting up to 30 min
+    for the next slot boundary. The scheduler's own dhw_command() sees the same
+    tank temperature at the boundary, so it will not re-lower the target while
+    the tank is still cold.
+    """
     period = config.daemon.ecodan_poll_seconds
     while True:
         try:
             dhw = await _get_dhw_state_async(config.melcloud)
             state.latest_dhw = dhw
             state.latest_dhw_at = datetime.now(timezone.utc)
+            if manage_dhw and not dry_run:
+                await _comfort_guard(config, dhw)
             # Persist too (worker thread: SQLite may wait on the optimizer's
             # write lock). Best-effort — the in-memory state is already set.
             try:
@@ -216,6 +236,27 @@ async def _poll_ecodan_loop(config: AppConfig, state: DaemonState) -> None:
         except Exception as exc:
             logger.warning("DHW poll failed: %s", exc)
         await asyncio.sleep(period)
+
+
+async def _comfort_guard(config: AppConfig, dhw: dict) -> None:
+    """Release a held-low tank target when the tank is below the comfort floor."""
+    cfg = config.dhw
+    if cfg.off_mode != "setpoint":
+        return
+    tank = dhw.get("tank_temperature")
+    target = dhw.get("target_tank_temperature")
+    if dhw.get("operation_mode") == "force_hot_water" or target is None:
+        return  # a planned slot is heating already, or nothing to compare
+    if not guard_active(tank, cfg) or abs(float(target) - cfg.off_target_c) > 0.25:
+        return
+    logger.warning(
+        "DHW comfort guard: tank %.1f°C < %.1f°C in an off slot — restoring %g°C target",
+        tank, cfg.min_tank_c, cfg.target_c,
+    )
+    try:
+        await apply_dhw_async(config.melcloud, release_command(cfg))
+    except Exception as exc:
+        logger.error("DHW comfort guard write failed: %s", exc)
 
 
 async def _optimizer_loop(
@@ -309,7 +350,9 @@ async def _run(
 
     tasks = [
         asyncio.create_task(_poll_inverter_loop(config, state), name="inverter_poll"),
-        asyncio.create_task(_poll_ecodan_loop(config, state), name="ecodan_poll"),
+        asyncio.create_task(
+            _poll_ecodan_loop(config, state, manage_dhw, dry_run), name="ecodan_poll"
+        ),
         asyncio.create_task(
             _optimizer_loop(config, state, manage_dhw, output, dry_run),
             name="optimizer",
@@ -338,7 +381,7 @@ async def _run(
 def _apply_shutdown_fallback(
     config: AppConfig, manage_dhw: bool, dry_run: bool, timeout_s: float = 45.0
 ) -> None:
-    """Best-effort safe state on exit: inverter → ECO, DHW → auto.
+    """Best-effort safe state on exit: inverter → ECO, DHW → auto at normal target.
 
     Runs in a daemon thread with a join timeout so an unreachable inverter or
     MELCloud cannot hang systemctl stop / host shutdown. Must run after
@@ -349,12 +392,12 @@ def _apply_shutdown_fallback(
         logger.info("Dry-run — skipping shutdown safe fallback")
         return
     logger.info(
-        "Applying shutdown safe fallback (inverter → ECO, DHW → auto; timeout %.0fs)", timeout_s
+        "Applying shutdown safe fallback (inverter → ECO, DHW released; timeout %.0fs)", timeout_s
     )
     t = threading.Thread(
         target=scheduler._apply_safe_fallback,
         args=(config,),
-        kwargs={"manage_dhw": manage_dhw},
+        kwargs={"manage_dhw": manage_dhw, "allow_axle_hold": False},
         name="shutdown-fallback",
         daemon=True,
     )
@@ -371,7 +414,7 @@ def main() -> None:
     parser.add_argument(
         "--no-dhw",
         action="store_true",
-        help="Disable DHW management — Ecodan stays in auto mode, DHW excluded from optimization",
+        help="Disable DHW management — Ecodan left in auto at its normal target, DHW excluded from optimization",
     )
     parser.add_argument(
         "--output",

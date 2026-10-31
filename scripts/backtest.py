@@ -56,7 +56,7 @@ def main() -> None:
     ap.add_argument("--db", default=os.getenv("DB_PATH", "octoopt2.db"))
     ap.add_argument("--tariffs", default="agile", help="comma list of pair names/specs (see backtest.tariffs.DEFAULT_PAIRS)")
     ap.add_argument("--region", default=os.getenv("OCTOPUS_DNO_REGION", "G"))
-    ap.add_argument("--standing-product", default="AGILE-24-10-01", help="product whose standing charge applies to DB-priced pairs")
+    ap.add_argument("--standing-product", default=None, help="product whose standing charge applies to DB-priced pairs (default: the configured import tariff's product, else AGILE-24-10-01)")
     ap.add_argument("--sell-fixed", type=float, default=None, help="override every sell price with a constant £/kWh")
     ap.add_argument("--cycle-cost", type=float, default=0.0, help="virtual cycle cost for hindsight (£/kWh)")
     ap.add_argument("--min-soc", type=float, default=None, help="planning/sim floor %% (default: config)")
@@ -71,8 +71,16 @@ def main() -> None:
     ap.add_argument("--replay", action="store_true", help="also run the rolling-horizon replay (slow)")
     ap.add_argument("--replan-every", type=int, default=1)
     ap.add_argument("--replay-solar", choices=["p50", "pred", "actual"], default="p50")
-    ap.add_argument("--replay-load", choices=["pred", "actual"], default="pred")
+    ap.add_argument("--replay-load", choices=["pred", "actual", "model"], default="pred",
+                    help="pred = stored prediction; actual = perfect load; model = re-fit the load model "
+                         "walk-forward each day (see --load-*)")
+    ap.add_argument("--load-half-life", type=float, default=None, help="load model recency half-life in days (0 = unweighted; default: config)")
+    ap.add_argument("--load-hdd-base", default=None, help="heating-degree base °C ('' = legacy linear α; default: config)")
+    ap.add_argument("--load-train-days", type=int, default=None)
+    ap.add_argument("--load-temp", choices=["observed", "forecast"], default="observed", help="temperature source for --replay-load model")
     ap.add_argument("--solar-scale", type=float, default=1.0, help="multiply the replay's solar forecast")
+    ap.add_argument("--axle-events", default=None, metavar="PATH",
+                    help="JSON list of Axle events [{start_time,end_time,import_export}]; their payment is added to every strategy's prices")
     ap.add_argument("--refresh-tariffs", action="store_true")
     ap.add_argument("--json", dest="json_path", default=None)
     ap.add_argument("--output", action="store_true", help="write web/backtests/<from>_<to>.json + index.json")
@@ -104,6 +112,26 @@ def main() -> None:
     slots = load_slots(args.db, from_utc, to_utc)
     if not slots:
         sys.exit(f"No price rows between {args.from_} and {args.to} in {args.db}")
+    load_cfg = None
+    if args.replay_load == "model":
+        from dataclasses import replace as _replace
+        from octoopt2.backtest.loadmodel import walk_forward_predictions
+        from octoopt2.config import LoadModelConfig
+        load_cfg = LoadModelConfig.from_env()
+        if args.load_half_life is not None:
+            load_cfg = _replace(load_cfg, half_life_days=args.load_half_life or None)
+        if args.load_hdd_base is not None:
+            base = args.load_hdd_base.strip().lower()
+            load_cfg = _replace(load_cfg, hdd_base_c=None if base in ("", "none") else float(base))
+        if args.load_train_days is not None:
+            load_cfg = _replace(load_cfg, train_days=args.load_train_days)
+        days = sorted({s.london_day for s in slots})
+        print(f"Re-fitting load model walk-forward over {len(days)} days: {load_cfg}", file=sys.stderr)
+        preds = walk_forward_predictions(args.db, days, load_cfg, temp_source=args.load_temp)
+        for s in slots:
+            if s.slot_start in preds:
+                s.pred_load_kwh = preds[s.slot_start]
+        args.replay_load = "pred"
     segments, excluded = segment_days(slots, floor_kwh=battery.min_soc_kwh, capacity_kwh=battery.capacity_kwh)
     n_days = sum(len(s.days) for s in segments)
     print(f"Loaded {len(slots)} slots; {n_days} complete days in {len(segments)} segment(s); {len(excluded)} excluded", file=sys.stderr)
@@ -111,6 +139,17 @@ def main() -> None:
     from octoopt2.backtest import tariffs as T
     pairs = [T.parse_pair_spec(x.strip()) for x in args.tariffs.split(",") if x.strip()]
     api_key = os.getenv("OCTOPUS_API_KEY")
+    if args.standing_product is None:
+        # DB prices come from the live import tariff; default its product's standing charge.
+        live = os.getenv("OCTOPUS_IMPORT_TARIFF_CODE") or os.getenv("OCTOPUS_AGILE_TARIFF_CODE")
+        args.standing_product = "-".join(live.split("-")[2:-1]) if live else "AGILE-24-10-01"
+
+    axle_events = []
+    if args.axle_events:
+        from octoopt2.data.axle import parse_event
+        with open(args.axle_events) as fh:
+            axle_events = [e for e in (parse_event(x) for x in json.load(fh)) if e is not None]
+        print(f"Axle: {len(axle_events)} event(s) loaded from {args.axle_events}", file=sys.stderr)
 
     def price_for_factory(pair):
         def price_for(seg):
@@ -120,11 +159,19 @@ def main() -> None:
                 api_key=api_key, refresh=args.refresh_tariffs,
             )
             sell = [args.sell_fixed] * len(ps.sell) if args.sell_fixed is not None else ps.sell
+            buy = ps.buy
+            if axle_events:
+                from octoopt2.config import AxleConfig
+                from octoopt2.data.axle import slot_uplift
+                from octoopt2.optimizer.model import apply_uplift
+                # Same £/kWh the daemon plans with (AXLE_EXPORT_GBP_KWH / AXLE_IMPORT_GBP_KWH).
+                up = slot_uplift(axle_events, [s.slot_start for s in seg.slots], AxleConfig.from_env())
+                buy, sell = apply_uplift(buy, sell, up)
             standing = ps.standing_by_day
             if pair.import_product is None:
-                # DB prices are Agile: price the standing charge from the live product
+                # DB prices are the live import tariff: price the standing charge from its product
                 standing = _standing_for(args.db, args.standing_product, args.region, seg, api_key, args.refresh_tariffs)
-            return ps.buy, sell, standing, ps.notes
+            return buy, sell, standing, ps.notes
         return price_for
 
     rolling = RollingOptions(replan_every=args.replan_every, time_limit_s=min(args.time_limit, 20),
@@ -149,6 +196,7 @@ def main() -> None:
         "max_export_kw": args.max_export_kw, "cycle_cost": args.cycle_cost, "terminal": args.terminal,
         "lookahead_days": args.lookahead_days, "excluded": [(d.isoformat(), r) for d, r in excluded],
         "days": n_days, "replay": vars(rolling) if rolling else None,
+        "load_model": vars(load_cfg) if load_cfg else "stored",
     }
     print(render_markdown(results, diag, acc, meta))
     payload = to_json(results, diag, acc, meta)

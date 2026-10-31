@@ -3,7 +3,11 @@
 Fits a temperature-adjusted, DHW-adjusted baseline from historical *gross*
 household load:
 
-    predicted_load[t] = baseline[day_type][slot_index] + α * (temp[t] - ref_temp)
+    predicted_load[t] = baseline[day_type][slot_index] + α * max(0, hdd_base - temp[t])
+
+(or, with LoadModelConfig.hdd_base_c = None, the legacy α * (temp[t] - ref_temp)).
+The least-squares fit is recency-weighted (half-life LoadModelConfig.half_life_days)
+so the baseline tracks the season instead of averaging eight weeks of history.
 
 The baseline represents NON-DHW gross load. The fit is a single least-squares
 regression of measured gross load on:
@@ -37,6 +41,7 @@ from zoneinfo import ZoneInfo
 import holidays
 import numpy as np
 
+from ..config import LoadModelConfig
 from ..db import get_conn
 
 # Each 30-min slot is 0.5 h, so kWh = mean_power_W / 1000 * 0.5.
@@ -79,6 +84,13 @@ class LoadModel:
     # nameplate config value (see optimizer.model.optimize).
     dhw_kwh_per_slot: float = 0.0
     fitted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Heating-degree base (°C) when the HDD form was fitted; None = legacy linear.
+    hdd_base_c: float | None = None
+    # Recency half-life (days) used for the fit; None = unweighted.
+    half_life_days: float | None = None
+    train_days: int = TRAINING_DAYS
+    # Kish effective sample size of the weighted fit (== n_slots when unweighted).
+    n_eff: float | None = None
 
     def predict(
         self,
@@ -99,23 +111,37 @@ class LoadModel:
             baseline_kwh = self.baseline[day_type][slot_idx]
 
             temp = _nearest_temperature(slot_start, temperatures)
-            temp_adjustment = self.alpha * (temp - self.ref_temp) if temp is not None else 0.0
+            temp_adjustment = self.alpha * self._temp_term(temp) if temp is not None else 0.0
 
             predictions.append(max(MIN_LOAD_KWH, baseline_kwh + temp_adjustment))
         return predictions
 
+    def _temp_term(self, temp: float) -> float:
+        if self.hdd_base_c is not None:
+            return max(0.0, self.hdd_base_c - temp)
+        return temp - self.ref_temp
 
-def fit_load_model(db_path: str) -> LoadModel | None:
+
+def fit_load_model(
+    db_path: str,
+    cfg: LoadModelConfig | None = None,
+    now: datetime | None = None,
+) -> LoadModel | None:
     """Fit the load model from historical gross load, weather, and DHW schedule.
 
-    Jointly fits, by least squares:
+    Jointly fits, by (recency-weighted) least squares:
       gross_load[t] = baseline[day_type, slot_index]
-                      + α·(temp[t] - ref_temp)
+                      + α·max(0, hdd_base − temp[t])      (or α·(temp − ref_temp))
                       + β·dhw_on[t]
     so `baseline` is the non-DHW load and β is the empirical DHW draw per
     enabled slot. Returns None if there is insufficient data (< MIN_SLOTS).
+
+    `now` bounds every loader (only rows before `now` are used), which makes
+    the fit walk-forward safe for backtests; it defaults to the current time.
     """
-    gross = _load_gross_load(db_path)
+    cfg = cfg or LoadModelConfig()
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    gross = _load_gross_load(db_path, now, train_days=cfg.train_days)
     if len(gross) < MIN_SLOTS:
         logger.warning(
             "Only %d gross-load slots available (need %d) — load model not fitted",
@@ -124,8 +150,8 @@ def fit_load_model(db_path: str) -> LoadModel | None:
         )
         return None
 
-    weather = _load_weather(db_path)
-    dhw_sched = _load_dhw_schedule(db_path)
+    weather = _load_weather(db_path, now)
+    dhw_sched = _load_dhw_schedule(db_path, now)
     logger.info(
         "Fitting load model from %d gross-load slots, %d weather slots",
         len(gross),
@@ -150,7 +176,21 @@ def fit_load_model(db_path: str) -> LoadModel | None:
 
     fit_idx = np.flatnonzero(fit_mask)
     temp_vals = np.array([temps[i] if temps[i] is not None else 0.0 for i in fit_idx])
-    ref_temp = float(temp_vals.mean()) if use_temp else 0.0
+
+    # Recency weights: newest slot weight 1, halving every half_life_days.
+    age_days = np.array([(now - slot_starts[i]).total_seconds() / 86400.0 for i in fit_idx])
+    if cfg.half_life_days:
+        w = np.power(0.5, np.clip(age_days, 0.0, None) / cfg.half_life_days)
+    else:
+        w = np.ones(len(fit_idx))
+    sw = np.sqrt(w)
+    n_eff = float(w.sum() ** 2 / (w ** 2).sum()) if len(w) else 0.0
+
+    ref_temp = float(np.average(temp_vals, weights=w)) if use_temp else 0.0
+    if use_temp and cfg.hdd_base_c is not None:
+        temp_col = np.maximum(0.0, cfg.hdd_base_c - temp_vals)
+    else:
+        temp_col = temp_vals - ref_temp
 
     # One design column per (day_type, slot_index) group present in the data,
     # plus (optionally) a temperature column and a DHW column.
@@ -163,11 +203,11 @@ def fit_load_model(db_path: str) -> LoadModel | None:
         X[row, groups[g]] = 1.0
         col = p
         if use_temp:
-            X[row, col] = temp_vals[row] - ref_temp
+            X[row, col] = temp_col[row]
             col += 1
         X[row, col] = dhw_on[i]
 
-    coef, *_ = np.linalg.lstsq(X, loads[fit_idx], rcond=None)
+    coef, *_ = np.linalg.lstsq(X * sw[:, None], loads[fit_idx] * sw, rcond=None)
     alpha = float(coef[p]) if use_temp else 0.0
     beta = float(coef[p + (1 if use_temp else 0)])
     # β is an energy and feeds the optimizer — clamp away negative noise.
@@ -181,12 +221,28 @@ def fit_load_model(db_path: str) -> LoadModel | None:
     for (day_type, slot_idx), j in groups.items():
         baseline[day_type][slot_idx] = coef[j]
 
+    # Day types with (effectively) no recent data get a borrowed baseline:
+    # holidays behave like weekends, and a weekend seen < 1 weighted day
+    # (possible with short half-lives) like a weekday. Without this, a group
+    # absent from the window predicts the MIN_LOAD floor all day.
+    weighted_days = {dt: 0.0 for dt in baseline}
+    for row, (dt, _) in enumerate(group_of):
+        weighted_days[dt] += w[row] / 48.0
+    if weighted_days["weekend"] < 1.0:
+        baseline["weekend"] = baseline["weekday"].copy()
+    if weighted_days["holiday"] < 1.0:
+        baseline["holiday"] = baseline["weekend"].copy()
+
     logger.info(
-        "Load model fitted: α=%.4f kWh/°C, β(DHW)=%.3f kWh/slot, ref_temp=%.1f°C, n=%d slots",
+        "Load model fitted: α=%.4f kWh/°C (%s), β(DHW)=%.3f kWh/slot, ref_temp=%.1f°C, "
+        "n=%d slots, n_eff=%.0f, half_life=%s d",
         alpha,
+        f"HDD base {cfg.hdd_base_c}°C" if (use_temp and cfg.hdd_base_c is not None) else "linear",
         beta,
         ref_temp,
         len(fit_idx),
+        n_eff,
+        cfg.half_life_days,
     )
     return LoadModel(
         baseline=baseline,
@@ -194,6 +250,10 @@ def fit_load_model(db_path: str) -> LoadModel | None:
         ref_temp=ref_temp,
         n_slots=int(len(fit_idx)),
         dhw_kwh_per_slot=beta,
+        hdd_base_c=cfg.hdd_base_c if use_temp else None,
+        half_life_days=cfg.half_life_days,
+        train_days=cfg.train_days,
+        n_eff=n_eff,
     )
 
 
@@ -273,7 +333,9 @@ def _nearest_temperature(
     return None
 
 
-def _load_gross_load(db_path: str, now: datetime | None = None) -> dict[datetime, float]:
+def _load_gross_load(
+    db_path: str, now: datetime | None = None, train_days: int = TRAINING_DAYS,
+) -> dict[datetime, float]:
     """Aggregate inverter_readings.load_w into gross load (kWh) per 30-min slot.
 
     load_w is p_load_demand — gross household consumption behind the grid CT,
@@ -286,8 +348,8 @@ def _load_gross_load(db_path: str, now: datetime | None = None) -> dict[datetime
     prefix and chars 15-16 the minute — and bounded to the last TRAINING_DAYS,
     so the query returns one row per slot instead of every reading.
     """
-    now = now or datetime.now(timezone.utc)
-    since = (now - timedelta(days=TRAINING_DAYS)).astimezone(timezone.utc)
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    since = (now - timedelta(days=train_days)).astimezone(timezone.utc)
     with get_conn(db_path) as conn:
         rows = conn.execute(
             """
@@ -297,11 +359,11 @@ def _load_gross_load(db_path: str, now: datetime | None = None) -> dict[datetime
                    AVG(load_w) AS load_w,
                    COUNT(*)    AS n
             FROM inverter_readings
-            WHERE recorded_at >= ?
+            WHERE recorded_at >= ? AND recorded_at < ?
             GROUP BY bucket
             ORDER BY bucket
             """,
-            (since.isoformat(),),
+            (since.isoformat(), now.isoformat()),
         ).fetchall()
     return {
         datetime.fromisoformat(r["bucket"]).replace(tzinfo=timezone.utc):
@@ -311,16 +373,17 @@ def _load_gross_load(db_path: str, now: datetime | None = None) -> dict[datetime
     }
 
 
-def _load_dhw_schedule(db_path: str) -> dict[datetime, int]:
+def _load_dhw_schedule(db_path: str, now: datetime | None = None) -> dict[datetime, int]:
     """Load historical DHW enable flags as slot_start → 0/1 from the schedule.
 
     This is the *planned* dhw_on (what the optimizer enabled), used as the DHW
     regressor. It is not confirmed actuation — see dhw_readings for ground-truth
     tank state logged each slot, which a future refit can switch to.
     """
+    upto = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     with get_conn(db_path) as conn:
         rows = conn.execute(
-            "SELECT slot_start, dhw_on FROM schedule"
+            "SELECT slot_start, dhw_on FROM schedule WHERE slot_start < ?", (upto,)
         ).fetchall()
     return {
         datetime.fromisoformat(r["slot_start"]).astimezone(timezone.utc): int(r["dhw_on"])
@@ -328,7 +391,7 @@ def _load_dhw_schedule(db_path: str) -> dict[datetime, int]:
     }
 
 
-def _load_weather(db_path: str) -> dict[datetime, float]:
+def _load_weather(db_path: str, now: datetime | None = None) -> dict[datetime, float]:
     """Load temperature history as slot_start → temperature_c for training.
 
     Observed (archive) readings in weather_observed win where present; slots
@@ -336,20 +399,23 @@ def _load_weather(db_path: str) -> dict[datetime, float]:
     weather_forecast. The ±30 min nearest-match in _nearest_temperature then
     bridges the hourly/15-min resolution gap as before.
     """
+    upto = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     with get_conn(db_path) as conn:
         forecast = conn.execute(
             """
             SELECT slot_start, temperature_c FROM weather_forecast
-            WHERE temperature_c IS NOT NULL
+            WHERE temperature_c IS NOT NULL AND slot_start < ?
             ORDER BY slot_start
-            """
+            """,
+            (upto,),
         ).fetchall()
         observed = conn.execute(
             """
             SELECT slot_start, temperature_c FROM weather_observed
-            WHERE temperature_c IS NOT NULL
+            WHERE temperature_c IS NOT NULL AND slot_start < ?
             ORDER BY slot_start
-            """
+            """,
+            (upto,),
         ).fetchall()
     out = {
         datetime.fromisoformat(r["slot_start"]): r["temperature_c"]

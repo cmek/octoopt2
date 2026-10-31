@@ -8,7 +8,8 @@ solar and never force-imports or force-exports. One command does three things:
   2. Battery reserve floor → --reserve % (default 20), written in the SAME
      register batch as ECO so the ECO command's own reserve write can never
      transiently clobber it to 4%
-  3. Ecodan DHW → "auto" (heat pump follows its own onboard schedule)
+  3. Ecodan DHW → "auto" at the normal tank target (heat pump follows its own
+     onboard schedule; a target lowered for an off slot is restored)
 
 Stop the daemon FIRST — its next optimizer tick would overwrite all of this:
 
@@ -115,7 +116,7 @@ def _daemon_running(metrics_port: int) -> bool:
 
 def main() -> int:
     from octoopt2.config import AppConfig
-    from octoopt2.control.ecodan import get_dhw_state, set_dhw
+    from octoopt2.control.ecodan import get_dhw_state, release_command, release_dhw
     from octoopt2.control.inverter import set_eco_mode
 
     parser = argparse.ArgumentParser(
@@ -165,9 +166,14 @@ def main() -> int:
             except Exception as exc:
                 logger.error("Failed to read DHW state from MELCloud: %s", exc)
                 return 1
+            want = release_command(config.dhw)
             mode = dhw.get("operation_mode")
-            ok = mode == "auto"
-            print(f"  {'PASS' if ok else 'FAIL'}  DHW auto (mode {mode!r}, tank {dhw.get('tank_temperature')}°C)")
+            target = dhw.get("target_tank_temperature")
+            ok = mode == "auto" and (want.target_c is None or target == want.target_c)
+            print(
+                f"  {'PASS' if ok else 'FAIL'}  DHW released (mode {mode!r}, target {target}°C, "
+                f"expected {want.describe()}; tank {dhw.get('tank_temperature')}°C)"
+            )
             all_ok = all_ok and ok
 
         print(f"\n{'All checks passed — away state is in place.' if all_ok else 'CHECK FAILED — run octoopt2-away to (re)apply the away state.'}")
@@ -199,13 +205,13 @@ def main() -> int:
     if args.dry_run:
         print("\nDry-run — would do:")
         print(f"  1. Inverter → ECO mode with reserve floor {args.reserve}% (both reserve registers)")
-        print("  2. DHW → auto" if not args.no_dhw else "  2. DHW: skipped (--no-dhw)")
+        print(f"  2. DHW → {release_command(config.dhw).describe()}" if not args.no_dhw else "  2. DHW: skipped (--no-dhw)")
         return 0
 
     # ── 3. Inverter → ECO + reserve in one batch ───────────────────────────
     print(f"\nSetting inverter to ECO with reserve floor {args.reserve}% …")
     try:
-        set_eco_mode(config.givenergy, config.db_path, reserve_pct=args.reserve)
+        set_eco_mode(config.givenergy, config.db_path, reserve_pct=args.reserve, trigger="away")
     except Exception as exc:
         logger.error("Failed to set ECO mode: %s", exc)
         return 1
@@ -221,11 +227,12 @@ def main() -> int:
         logger.error("Inverter writes were sent but did not verify — check the GivEnergy app")
         return 1
 
-    # ── 5. DHW → auto ───────────────────────────────────────────────────────
+    # ── 5. DHW → released (auto, normal target) ─────────────────────────────
     if not args.no_dhw:
-        print("\nSetting DHW to auto …")
+        want = release_command(config.dhw)
+        print(f"\nSetting DHW to {want.describe()} …")
         try:
-            set_dhw(config.melcloud, enabled=False)
+            release_dhw(config.melcloud, config.dhw)
             state = get_dhw_state(config.melcloud)
         except Exception as exc:
             logger.error(
@@ -234,10 +241,14 @@ def main() -> int:
             )
             return 1
         mode = state.get("operation_mode")
+        target = state.get("target_tank_temperature")
         if mode != "auto":
             logger.error("DHW mode is %r, expected 'auto' — check MELCloud", mode)
             return 1
-        print(f"  PASS  DHW auto (tank {state.get('tank_temperature')}°C)")
+        if want.target_c is not None and target != want.target_c:
+            logger.error("DHW target is %s°C, expected %g°C — check MELCloud", target, want.target_c)
+            return 1
+        print(f"  PASS  DHW {want.describe()} (tank {state.get('tank_temperature')}°C)")
 
     # ── 6. Summary ───────────────────────────────────────────────────────────
     print(

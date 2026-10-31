@@ -23,15 +23,25 @@ AC power balance (per slot):
 SoC update:
   soc[t+1] = soc[t] + bat_charge[t]*charge_eff - bat_discharge[t]/discharge_eff
 
+DHW per UK calendar day d (manage_dhw):
+  min_slots − done[d] ≤ Σ_{t∈d} dhw_on[t] ≤ max_slots − done[d]
+  where done[d] is the number of ON slots already executed that day before the
+  horizon started (dhw_done_today), so a re-run mid-day cannot re-plan a full
+  quota into the remaining slots.
+
 Objective:
-  minimise Σ_t ( buy_price[t]*grid_import[t] - sell_price[t]*grid_export[t]
+  minimise Σ_t ( buy_eff[t]*grid_import[t] - sell_eff[t]*grid_export[t]
                  + cycle_cost*(bat_charge[t] + bat_discharge[t]) )
            - terminal_value * soc[n]
+  where buy_eff/sell_eff are the tariff prices plus any Axle event uplift
+  (inputs.axle_uplift: + on sell for export events, − on buy for import
+  events). slot_cost_gbp uses the same effective prices so it reflects what the
+  plan is worth; the tariff prices stay in inputs for persistence.
 """
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pulp
@@ -53,12 +63,36 @@ class OptimizerInput:
     solar_forecast: list[float]   # kWh per slot
     load_forecast: list[float]    # kWh per slot (predicted NON-DHW gross load;
                                   # DHW added separately via dhw_kwh_per_slot)
+    axle_uplift: list[float] | None = None  # £/kWh: >0 added to sell (export
+                                  # event), <0 added to buy (import event)
 
     def __post_init__(self) -> None:
         n = len(self.slot_starts)
         if not (len(self.buy_prices) == len(self.sell_prices)
                 == len(self.solar_forecast) == len(self.load_forecast) == n):
             raise ValueError("All input lists must have the same length")
+        if self.axle_uplift is not None and len(self.axle_uplift) != n:
+            raise ValueError("axle_uplift must have the same length as slot_starts")
+
+    def effective_prices(self) -> tuple[list[float], list[float]]:
+        """(buy, sell) with any Axle uplift applied."""
+        return apply_uplift(self.buy_prices, self.sell_prices, self.axle_uplift)
+
+
+def apply_uplift(
+    buy: list[float], sell: list[float], uplift: list[float] | None
+) -> tuple[list[float], list[float]]:
+    """Fold a signed per-slot payment into the prices the optimizer sees.
+
+    uplift > 0 (export event) is added to the sell price; uplift < 0 (import
+    event) is added to the buy price, i.e. the import gets cheaper. One place
+    for the rule, shared by the live optimizer and the backtest.
+    """
+    if not uplift:
+        return list(buy), list(sell)
+    buy_eff = [b + min(u, 0.0) for b, u in zip(buy, uplift)]
+    sell_eff = [s + max(u, 0.0) for s, u in zip(sell, uplift)]
+    return buy_eff, sell_eff
 
 
 @dataclass
@@ -93,6 +127,7 @@ def optimize(
     manage_dhw: bool = True,
     dhw_kwh_per_slot: float | None = None,
     *,
+    dhw_done_today: dict[date, int] | None = None,
     time_limit_s: int = 30,
     allow_curtailment: bool = True,
     terminal_soc_value_gbp_kwh: float | None = None,
@@ -119,6 +154,9 @@ def optimize(
         nameplate `dhw.power_kw * SLOT_HOURS` because the tank is often already
         at target when DHW is commanded. Falls back to the nameplate value when
         None (e.g. before a model has been fitted).
+    dhw_done_today: ON slots already executed per UK date before the horizon
+        (see the scheduler). Subtracted from that day's min/max so the daily
+        quota is honoured across re-runs. None/missing day → 0.
     """
     n = len(inputs.slot_starts)
     if n == 0:
@@ -200,10 +238,12 @@ def optimize(
     # terminal_soc_value so the plan does not drain to the floor merely because
     # the horizon (which can be as short as a few hours before tomorrow's
     # prices are published) ends.
+    buy_eff, sell_eff = inputs.effective_prices()
+    uplift = inputs.axle_uplift or [0.0] * n
     prob += (
         pulp.lpSum(
-            inputs.buy_prices[t] * grid_import[t]
-            - inputs.sell_prices[t] * grid_export[t]
+            buy_eff[t] * grid_import[t]
+            - sell_eff[t] * grid_export[t]
             + battery.cycle_cost_gbp_kwh * (bat_charge[t] + bat_discharge[t])
             for t in range(n)
         )
@@ -249,22 +289,28 @@ def optimize(
         # slots so it can never re-export battery- or grid-sourced energy. The
         # cap is always satisfiable (excess solar = solar − load − bat_charge ≤
         # solar), so it cannot make the problem infeasible. Positive-price slots
-        # are unconstrained here and keep full battery-export arbitrage.
-        if inputs.buy_prices[t] < 0:
+        # are unconstrained here and keep full battery-export arbitrage. An Axle
+        # export event (uplift > 0) pays ~£1/kWh for export, which is a real
+        # payment rather than a churn artefact, so it lifts the cap.
+        if buy_eff[t] < 0 and uplift[t] <= 0:
             prob += grid_export[t] <= solar_t
 
     # ── DHW daily minimums and maximums ───────────────────────────────────
     if manage_dhw:
-        for day_slots in _group_slots_by_day(inputs.slot_starts):
+        done_by_day = dhw_done_today or {}
+        for day, day_slots in _group_slots_by_day(inputs.slot_starts).items():
+            done = done_by_day.get(day, 0)
+            need = max(0, dhw.min_slots_per_day - done)
+            cap = max(0, dhw.max_slots_per_day - done)
             # The horizon starts mid-day and ends mid-day, so the first and last
-            # UK days are partial. A partial day holding fewer than
-            # min_slots_per_day slots cannot satisfy the daily minimum — forcing
-            # it would make the whole problem infeasible — so only require the
-            # minimum on days the horizon covers enough of. The cap still applies
-            # to every (partial) day to avoid over-heating at the edges.
-            if len(day_slots) >= dhw.min_slots_per_day:
-                prob += pulp.lpSum(dhw_on[t] for t in day_slots) >= dhw.min_slots_per_day
-            prob += pulp.lpSum(dhw_on[t] for t in day_slots) <= dhw.max_slots_per_day
+            # UK days are partial. A partial day holding fewer slots than the
+            # outstanding minimum cannot satisfy it — forcing it would make the
+            # whole problem infeasible — so only require the minimum on days the
+            # horizon covers enough of. The cap still applies to every (partial)
+            # day to avoid over-heating at the edges.
+            if need and len(day_slots) >= need:
+                prob += pulp.lpSum(dhw_on[t] for t in day_slots) >= need
+            prob += pulp.lpSum(dhw_on[t] for t in day_slots) <= cap
     else:
         for t in range(n):
             prob += dhw_on[t] == 0
@@ -316,7 +362,7 @@ def optimize(
             dhw_on=bool(round(_val(dhw_on[t]))),
             soc_start_kwh=soc_start,
             soc_end_kwh=soc_end,
-            slot_cost_gbp=inputs.buy_prices[t] * gi - inputs.sell_prices[t] * ge,
+            slot_cost_gbp=buy_eff[t] * gi - sell_eff[t] * ge,
             curtailed_kwh=_val(curtail[t]),
         ))
 
@@ -336,16 +382,14 @@ def _val(var: pulp.LpVariable) -> float:
     return 0.0 if v is None else float(v)
 
 
-def _group_slots_by_day(slot_starts: list[datetime]) -> list[list[int]]:
+def _group_slots_by_day(slot_starts: list[datetime]) -> dict[date, list[int]]:
     """Group slot indices by UK calendar day.
 
-    Returns a list of lists of indices — one list per UK calendar day present in
-    the horizon, including partial days at the edges. The caller decides how to
-    treat under-covered partial days (see the DHW constraints in optimize()).
+    Returns {uk_date: [slot indices]} in horizon order, including partial days
+    at the edges. The caller decides how to treat under-covered partial days
+    (see the DHW constraints in optimize()).
     """
-    from collections import defaultdict
-    day_map: dict = defaultdict(list)
+    day_map: dict[date, list[int]] = {}
     for t, slot in enumerate(slot_starts):
-        local_date = slot.astimezone(LONDON).date()
-        day_map[local_date].append(t)
-    return list(day_map.values())
+        day_map.setdefault(slot.astimezone(LONDON).date(), []).append(t)
+    return day_map

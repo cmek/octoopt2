@@ -1,5 +1,6 @@
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -86,6 +87,16 @@ class GivEnergyConfig:
         )
 
 
+# How the controller holds the Ecodan off outside planned DHW slots.
+#   "setpoint" — lower the tank target to off_target_c so the heat pump's own
+#                thermostat does not reheat after a shower until a planned slot
+#                (or the comfort guard) restores target_c. Default.
+#   "auto"     — legacy: only clear forced-DHW mode and leave the target alone.
+#                The Ecodan then reheats on its own schedule whenever the tank
+#                drops, regardless of price.
+DHW_OFF_MODES = ("setpoint", "auto")
+
+
 @dataclass(frozen=True)
 class DhwConfig:
     # Power draw during DHW heating mode (kW) — Mitsubishi Ecodan typical
@@ -94,6 +105,25 @@ class DhwConfig:
     min_slots_per_day: int = 4
     # Maximum slots per day (prevents over-heating the tank)
     max_slots_per_day: int = 8
+    # See DHW_OFF_MODES.
+    off_mode: str = "setpoint"
+    # Normal tank target (°C): written in planned-ON slots and whenever control
+    # is released (safe fallback, shutdown, away mode, comfort guard).
+    target_c: float = 50.0
+    # Tank target held in planned-off slots under off_mode="setpoint". 40 °C is
+    # the lowest MELCloud accepts for an Ecodan tank.
+    off_target_c: float = 40.0
+    # Comfort guard: in an off slot, a tank below this (°C) gets target_c back
+    # so a heavy-use day never ends cold. 0 disables the guard.
+    min_tank_c: float = 35.0
+
+    def __post_init__(self) -> None:
+        if self.off_mode not in DHW_OFF_MODES:
+            raise ValueError(f"DHW_OFF_MODE must be one of {DHW_OFF_MODES}, got {self.off_mode!r}")
+        if not (self.off_target_c <= self.target_c):
+            raise ValueError("DHW_OFF_TARGET_C must not exceed DHW_TARGET_C")
+        if self.min_tank_c and not (self.min_tank_c < self.off_target_c):
+            raise ValueError("DHW_MIN_TANK_C must be below DHW_OFF_TARGET_C (or 0 to disable)")
 
     @classmethod
     def from_env(cls) -> "DhwConfig":
@@ -101,6 +131,61 @@ class DhwConfig:
             power_kw=float(os.getenv("DHW_POWER_KW", "1.5")),
             min_slots_per_day=int(os.getenv("DHW_MIN_SLOTS_PER_DAY", "4")),
             max_slots_per_day=int(os.getenv("DHW_MAX_SLOTS_PER_DAY", "8")),
+            off_mode=os.getenv("DHW_OFF_MODE", "setpoint").strip().lower(),
+            target_c=float(os.getenv("DHW_TARGET_C", "50")),
+            off_target_c=float(os.getenv("DHW_OFF_TARGET_C", "40")),
+            min_tank_c=float(os.getenv("DHW_MIN_TANK_C", "35")),
+        )
+
+
+def _import_tariff_code_from_env() -> str:
+    """OCTOPUS_IMPORT_TARIFF_CODE, falling back to the deprecated
+    OCTOPUS_AGILE_TARIFF_CODE (with a warning) so existing .env files keep working."""
+    code = os.getenv("OCTOPUS_IMPORT_TARIFF_CODE")
+    if code:
+        return code
+    legacy = os.getenv("OCTOPUS_AGILE_TARIFF_CODE")
+    if not legacy:
+        raise KeyError(
+            "OCTOPUS_IMPORT_TARIFF_CODE is not set (e.g. E-1R-AGILE-24-10-01-G or "
+            "E-1R-COSY-22-12-08-G); the deprecated OCTOPUS_AGILE_TARIFF_CODE is also accepted"
+        )
+    logging.getLogger(__name__).warning(
+        "OCTOPUS_AGILE_TARIFF_CODE is deprecated; rename it to OCTOPUS_IMPORT_TARIFF_CODE"
+    )
+    return legacy
+
+
+def _opt_float(name: str, default: float | None) -> float | None:
+    """Float env var where "" / "none" / "0" mean "disabled" (None)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    if raw in ("", "none", "off"):
+        return None
+    v = float(raw)
+    return None if v <= 0 else v
+
+
+@dataclass(frozen=True)
+class LoadModelConfig:
+    """Load-forecast model settings (see optimizer.forecast.fit_load_model)."""
+    # How many days of gross-load history the fit looks back over.
+    train_days: int = 56
+    # Exponential recency weighting half-life (days); None → unweighted OLS.
+    half_life_days: float | None = 10.0
+    # Heating-degree base (°C): the temperature term is max(0, base − T), so
+    # cold slots add load and warm ones add nothing. None → legacy linear
+    # α·(T − ref_temp).
+    hdd_base_c: float | None = 13.0
+
+    @classmethod
+    def from_env(cls) -> "LoadModelConfig":
+        return cls(
+            train_days=int(os.getenv("LOAD_MODEL_DAYS", "56")),
+            half_life_days=_opt_float("LOAD_MODEL_HALF_LIFE_DAYS", 10.0),
+            hdd_base_c=_opt_float("LOAD_MODEL_HDD_BASE_C", 13.0),
         )
 
 
@@ -110,7 +195,7 @@ class OctopusConfig:
     account_number: str
     mpan: str
     serial: str
-    agile_tariff_code: str
+    import_tariff_code: str   # buy tariff: Agile or a banded tariff such as Cosy
     outgoing_tariff_code: str
     dno_region: str
 
@@ -121,7 +206,7 @@ class OctopusConfig:
             account_number=os.environ["OCTOPUS_ACCOUNT_NUMBER"],
             mpan=os.environ["OCTOPUS_MPAN"],
             serial=os.environ["OCTOPUS_SERIAL"],
-            agile_tariff_code=os.environ["OCTOPUS_AGILE_TARIFF_CODE"],
+            import_tariff_code=_import_tariff_code_from_env(),
             outgoing_tariff_code=os.environ["OCTOPUS_OUTGOING_TARIFF_CODE"],
             dno_region=os.environ["OCTOPUS_DNO_REGION"],
         )
@@ -188,6 +273,34 @@ class LocationConfig:
 
 
 @dataclass(frozen=True)
+class AxleConfig:
+    """Axle Energy VPP, "Events Only" mode. Off unless AXLE_TOKEN is set.
+
+    Axle pays per kWh of metered export during grid events (and may call import
+    events). The event feed is polled with the token; the optimizer sees the
+    payment as a per-slot price uplift and the controller holds max export
+    (or max charge) through the event so Axle's own cloud command and ours agree.
+    """
+    token: str | None = None
+    export_gbp_kwh: float = 1.0      # paid per kWh exported during an export event
+    import_gbp_kwh: float = 1.0      # credited per kWh imported during an import event
+    hold_margin_minutes: int = 0     # keep the hold this long either side of the event
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token)
+
+    @classmethod
+    def from_env(cls) -> "AxleConfig":
+        return cls(
+            token=os.getenv("AXLE_TOKEN") or None,
+            export_gbp_kwh=float(os.getenv("AXLE_EXPORT_GBP_KWH", "1.0")),
+            import_gbp_kwh=float(os.getenv("AXLE_IMPORT_GBP_KWH", "1.0")),
+            hold_margin_minutes=int(os.getenv("AXLE_HOLD_MARGIN_MINUTES", "0")),
+        )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     givenergy: GivEnergyConfig
     octopus: OctopusConfig
@@ -198,8 +311,12 @@ class AppConfig:
     location: LocationConfig
     daemon: DaemonConfig
     db_path: str
-    # Slot duration in minutes (Octopus Agile is half-hourly)
+    # Slot duration in minutes (Octopus rates are planned per half-hour; banded
+    # tariffs are expanded to half-hours by the price feed)
     slot_minutes: int = 30
+    axle: AxleConfig = field(default_factory=AxleConfig)
+
+    load_model: LoadModelConfig = LoadModelConfig()
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -213,4 +330,7 @@ class AppConfig:
             location=LocationConfig.from_env(),
             daemon=DaemonConfig.from_env(),
             db_path=os.getenv("DB_PATH", "octoopt2.db"),
+            axle=AxleConfig.from_env(),
+
+            load_model=LoadModelConfig.from_env(),
         )

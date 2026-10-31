@@ -4,31 +4,100 @@ pymelcloud is async-only. All public functions here are synchronous wrappers
 that run the async code via asyncio.run(), keeping the rest of the codebase
 sync-friendly.
 
-DHW is controlled by switching the heat pump's operation mode:
-  "force_hot_water"  — actively heat the tank now
-  "auto"             — return to the heat pump's own schedule
+Two MELCloud properties control DHW:
+
+  operation_mode           "force_hot_water" heats the tank now. The Ecodan
+                           clears it by itself once the tank reaches target, so
+                           a forced slot is one-shot — "auto" is the resting
+                           state, not an "off" state.
+  target_tank_temperature  The Ecodan's own thermostat reheats whenever the
+                           tank falls ~10 °C below this, whatever the price.
+                           Holding it at DhwConfig.off_target_c outside planned
+                           slots is what actually keeps DHW off (off_mode
+                           "setpoint"); off_mode "auto" leaves it untouched.
+
+dhw_command() turns a plan decision plus the live tank temperature into the
+(force, target) pair to write; every writer (scheduler tick, daemon comfort
+guard, safe fallback, away mode) goes through apply_dhw().
 """
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import aiohttp
 import pymelcloud
 from pymelcloud import DEVICE_TYPE_ATW
 
-from ..config import MelCloudConfig
+from ..config import DhwConfig, MelCloudConfig
 from ..db import get_conn, record_fetch
 
 logger = logging.getLogger(__name__)
 
+MODE_FORCE = "force_hot_water"
+MODE_AUTO = "auto"
 
-def set_dhw(config: MelCloudConfig, enabled: bool) -> None:
-    """Enable or disable forced DHW heating.
 
-    enabled=True  → operation_mode = "force_hot_water"
-    enabled=False → operation_mode = "auto"
+@dataclass(frozen=True)
+class DhwCommand:
+    """What to write to the Ecodan: forced-DHW flag and tank target (°C).
+
+    target_c=None leaves the target as it is on the device.
     """
-    asyncio.run(_set_dhw_async(config, enabled))
+    force: bool
+    target_c: float | None
+
+    @property
+    def mode(self) -> str:
+        return MODE_FORCE if self.force else MODE_AUTO
+
+    def describe(self) -> str:
+        t = "" if self.target_c is None else f" {self.target_c:g}°C"
+        return f"{self.mode}{t}"
+
+
+def dhw_command(planned_on: bool, tank_c: float | None, dhw: DhwConfig) -> DhwCommand:
+    """Decide the Ecodan command for a slot.
+
+    planned ON                         → force, normal target
+    off, off_mode "auto"               → clear force, leave target (legacy)
+    off, tank below min_tank_c (guard) → clear force, normal target so the
+                                         Ecodan reheats; the tank is too cold
+                                         to wait for the next planned slot
+    off, otherwise                     → clear force, hold off_target_c
+    """
+    if planned_on:
+        return DhwCommand(force=True, target_c=dhw.target_c)
+    if dhw.off_mode == "auto":
+        return DhwCommand(force=False, target_c=None)
+    if guard_active(tank_c, dhw):
+        return DhwCommand(force=False, target_c=dhw.target_c)
+    return DhwCommand(force=False, target_c=dhw.off_target_c)
+
+
+def guard_active(tank_c: float | None, dhw: DhwConfig) -> bool:
+    """True when the comfort guard should override an off slot."""
+    return bool(dhw.min_tank_c) and tank_c is not None and tank_c < dhw.min_tank_c
+
+
+def release_command(dhw: DhwConfig) -> DhwCommand:
+    """Hand the Ecodan back to itself: auto mode at the normal target.
+
+    Used whenever octoopt2 stops managing DHW (safe fallback, daemon shutdown,
+    away mode, --no-dhw) so a lowered target can never outlive the controller.
+    Under off_mode "auto" the target is left alone, as before.
+    """
+    return DhwCommand(force=False, target_c=None if dhw.off_mode == "auto" else dhw.target_c)
+
+
+def apply_dhw(config: MelCloudConfig, cmd: DhwCommand) -> None:
+    """Write a DhwCommand to MELCloud (no-op when the device already matches)."""
+    asyncio.run(apply_dhw_async(config, cmd))
+
+
+def release_dhw(config: MelCloudConfig, dhw: DhwConfig) -> None:
+    """Sync shortcut for apply_dhw(release_command(dhw))."""
+    apply_dhw(config, release_command(dhw))
 
 
 def get_dhw_state(config: MelCloudConfig) -> dict:
@@ -120,17 +189,32 @@ async def _get_device(
     )
 
 
-async def _set_dhw_async(config: MelCloudConfig, enabled: bool) -> None:
-    mode = "force_hot_water" if enabled else "auto"
+async def apply_dhw_async(config: MelCloudConfig, cmd: DhwCommand) -> None:
+    """Write cmd to the device in one MELCloud call, skipping unchanged fields.
+
+    Reads the device first so a slot-boundary re-apply (same mode, same target)
+    costs one GET and no POST.
+    """
     async with aiohttp.ClientSession() as session:
         device = await _get_device(config, session)
         await device.update()
         current_mode = device.operation_mode
-        if current_mode == mode:
-            logger.debug("DHW already in mode '%s', no change needed", mode)
+        current_target = device.target_tank_temperature
+        props: dict = {}
+        if current_mode != cmd.mode:
+            props["operation_mode"] = cmd.mode
+        if cmd.target_c is not None and not _same_temp(current_target, cmd.target_c):
+            props["target_tank_temperature"] = cmd.target_c
+        if not props:
+            logger.debug("DHW already %s, no change needed", cmd.describe())
             return
-        logger.info("DHW → %s (was: %s)", mode, current_mode)
-        await device.set({"operation_mode": mode})
+        was = f"{current_mode} {current_target:g}°C" if current_target is not None else str(current_mode)
+        logger.info("DHW → %s (was: %s)", cmd.describe(), was)
+        await device.set(props)
+
+
+def _same_temp(a: float | None, b: float) -> bool:
+    return a is not None and abs(float(a) - b) < 0.25
 
 
 def _opt(obj, name: str):

@@ -124,8 +124,8 @@ def test_expand_rates_prefers_direct_debit():
     assert expand_rates(list(reversed(recs)), [utc(2026, 8, 1)]) == [pytest.approx(0.2613)]
 
 
-def test_expand_rates_asserts_half_hour_boundaries():
-    with pytest.raises(AssertionError):
+def test_expand_rates_rejects_off_boundary_records():
+    with pytest.raises(ValueError):
         expand_rates([rec(utc(2026, 1, 1, 0, 15), None, 10.0)], [utc(2026, 1, 1)])
 
 

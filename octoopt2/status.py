@@ -53,21 +53,38 @@ def _live(state, now: datetime) -> dict:
     }
 
 
-def _dhw(state, now: datetime) -> dict:
-    """DHW tank state from the latest MELCloud poll."""
+def _dhw(state, now: datetime, dhw_cfg=None) -> dict:
+    """DHW tank state from the latest MELCloud poll.
+
+    `control` says what octoopt2 is doing to the Ecodan right now:
+      forced   — planned slot, ForcedHotWaterMode set
+      held_low — off slot, tank target held at DHW_OFF_TARGET_C
+      auto     — Ecodan on its own thermostat at the normal target
+    """
     dhw = state.latest_dhw
     age = None
     if state.latest_dhw_at is not None:
         age = round((now - state.latest_dhw_at).total_seconds(), 1)
+    off_mode = dhw_cfg.off_mode if dhw_cfg else None
     if dhw is None:
-        return {"available": False, "age_s": age}
+        return {"available": False, "age_s": age, "off_mode": off_mode}
     mode = dhw.get("operation_mode") or "unknown"
+    target = dhw.get("target_tank_temperature")
+    if mode == "force_hot_water":
+        control = "forced"
+    elif (dhw_cfg is not None and off_mode == "setpoint" and target is not None
+          and abs(float(target) - dhw_cfg.off_target_c) < 0.25):
+        control = "held_low"
+    else:
+        control = "auto"
     return {
         "available": True,
         "tank_temp_c": dhw.get("tank_temperature"),
-        "target_temp_c": dhw.get("target_tank_temperature"),
+        "target_temp_c": target,
         "mode": mode,
         "heating": mode == "force_hot_water",
+        "control": control,
+        "off_mode": off_mode,
         "age_s": age,
     }
 
@@ -177,6 +194,30 @@ def _planner_and_cost(db_path: str, now: datetime) -> tuple[dict, dict, list]:
     return planner, cost, upcoming
 
 
+def _axle(db_path: str, now: datetime, axle_cfg=None) -> dict:
+    """Next/active Axle event and the plan's export through it."""
+    if axle_cfg is None or not getattr(axle_cfg, "enabled", False):
+        return {"enabled": False}
+    from .data.axle import active_event, next_event
+    ev = active_event(db_path, now, axle_cfg.hold_margin_minutes) or next_event(db_path, now)
+    out: dict = {"enabled": True, "next_event": None, "active": False, "planned_export_kwh": None}
+    if ev is None:
+        return out
+    out["next_event"] = {
+        "start": ev.start.isoformat(), "end": ev.end.isoformat(), "direction": ev.direction,
+        "updated_at": ev.updated_at.isoformat() if ev.updated_at else None,
+    }
+    out["active"] = ev.active(now, axle_cfg.hold_margin_minutes)
+    first_slot = ev.start.replace(minute=(ev.start.minute // 30) * 30, second=0, microsecond=0)
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT SUM(grid_export_kwh) AS e FROM schedule WHERE slot_start >= ? AND slot_start < ?",
+            (first_slot.isoformat(), ev.end.isoformat()),
+        ).fetchone()
+    out["planned_export_kwh"] = None if row is None or row["e"] is None else round(row["e"], 2)
+    return out
+
+
 def _feeds(db_path: str, now: datetime) -> dict:
     """Per-feed {fetch_age_s, coverage_lag_s} — see db.feed_freshness."""
     try:
@@ -201,7 +242,10 @@ def _history(state) -> list:
     return out
 
 
-def build_status(state, db_path: str, capacity_kwh: float, now: datetime | None = None) -> dict:
+def build_status(
+    state, db_path: str, capacity_kwh: float, now: datetime | None = None, dhw_cfg=None,
+    axle_cfg=None,
+) -> dict:
     """Assemble the full live status snapshot for the dashboard."""
     if now is None:
         now = datetime.now(timezone.utc)
@@ -210,10 +254,11 @@ def build_status(state, db_path: str, capacity_kwh: float, now: datetime | None 
         "now": now.isoformat(),
         "battery_capacity_kwh": capacity_kwh,
         "live": _live(state, now),
-        "dhw": _dhw(state, now),
+        "dhw": _dhw(state, now, dhw_cfg),
         "planner": planner,
         "cost": cost,
         "upcoming": upcoming,
         "feeds": _feeds(db_path, now),
+        "axle": _axle(db_path, now, axle_cfg),
         "history": _history(state),
     }

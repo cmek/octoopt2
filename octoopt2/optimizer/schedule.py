@@ -20,6 +20,7 @@ def save_schedule(
     upsert. `schedule` stays the latest-plan view.
     """
     optimized_at = result.optimized_at.isoformat()
+    uplift = inputs.axle_uplift or [None] * len(result.decisions)
     rows = []
     history_rows = []
     for t, decision in enumerate(result.decisions):
@@ -35,6 +36,7 @@ def save_schedule(
             inputs.buy_prices[t],
             inputs.sell_prices[t],
             optimized_at,
+            uplift[t] or None,
         ))
         history_rows.append((
             rows[-1][0],
@@ -53,6 +55,7 @@ def save_schedule(
             # getattr: older SlotDecision objects (e.g. built from DB rows) may
             # predate the curtailed_kwh field.
             getattr(decision, "curtailed_kwh", None),
+            uplift[t] or None,
         ))
 
     with get_conn(db_path) as conn:
@@ -62,8 +65,8 @@ def save_schedule(
                 slot_start, battery_charge_kwh, battery_discharge_kwh,
                 grid_import_kwh, grid_export_kwh, dhw_on,
                 predicted_load_kwh, predicted_solar_kwh,
-                buy_gbp_kwh, sell_gbp_kwh, optimized_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                buy_gbp_kwh, sell_gbp_kwh, optimized_at, axle_uplift_gbp_kwh
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(slot_start) DO UPDATE SET
                 battery_charge_kwh    = excluded.battery_charge_kwh,
                 battery_discharge_kwh = excluded.battery_discharge_kwh,
@@ -74,7 +77,8 @@ def save_schedule(
                 predicted_solar_kwh   = excluded.predicted_solar_kwh,
                 buy_gbp_kwh           = excluded.buy_gbp_kwh,
                 sell_gbp_kwh          = excluded.sell_gbp_kwh,
-                optimized_at          = excluded.optimized_at
+                optimized_at          = excluded.optimized_at,
+                axle_uplift_gbp_kwh   = excluded.axle_uplift_gbp_kwh
             """,
             rows,
         )
@@ -85,8 +89,8 @@ def save_schedule(
                 slot_start, optimized_at, battery_charge_kwh, battery_discharge_kwh,
                 grid_import_kwh, grid_export_kwh, dhw_on,
                 predicted_load_kwh, predicted_solar_kwh, buy_gbp_kwh, sell_gbp_kwh,
-                soc_start_kwh, soc_end_kwh, curtailed_kwh
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                soc_start_kwh, soc_end_kwh, curtailed_kwh, axle_uplift_gbp_kwh
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             history_rows,
         )
@@ -104,6 +108,7 @@ _RUN_FIELDS = (
     "status", "objective_gbp", "grid_cost_gbp", "solve_seconds",
     "horizon_slots", "horizon_start", "soc_start_kwh",
     "alpha", "beta", "ref_temp", "n_train_slots", "manage_dhw", "error",
+    "half_life_days", "hdd_base_c", "train_days",
 )
 
 

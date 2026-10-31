@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 SCHEMA = """
--- Half-hourly Octopus Agile prices (buy and sell)
+-- Half-hourly Octopus prices (buy and sell); banded import tariffs are expanded to half-hours
 CREATE TABLE IF NOT EXISTS prices (
     slot_start  TEXT NOT NULL,   -- ISO8601 UTC, e.g. "2024-01-15T14:00:00+00:00"
     buy_gbp_kwh  REAL NOT NULL,
@@ -113,7 +113,8 @@ CREATE TABLE IF NOT EXISTS inverter_last_command (
     applied_at     TEXT NOT NULL,
     mode           TEXT NOT NULL,       -- CHARGE | DISCHARGE_EXPORT | ECO
     power_register INTEGER NOT NULL,    -- charge/discharge limit register (1-50); 0 for ECO
-    total_writes   INTEGER NOT NULL DEFAULT 0  -- cumulative lifetime register writes sent
+    total_writes   INTEGER NOT NULL DEFAULT 0,  -- cumulative lifetime register writes sent
+    trigger        TEXT                 -- trigger of that write; "…+drift" = a one-off re-assert
 );
 
 -- Last successful fetch/write per data source (one row per feed, upserted on
@@ -133,7 +134,7 @@ CREATE TABLE IF NOT EXISTS inverter_commands (
     ok             INTEGER NOT NULL,    -- 1 = all writes acknowledged
     error          TEXT,
     slot_start     TEXT,                -- slot the decision was for (NULL for fallback/away)
-    trigger        TEXT                 -- fast | slow | fallback | away
+    trigger        TEXT                 -- fast | slow | fallback | away | axle; "+drift" suffix = re-asserted after register drift
 );
 
 CREATE TABLE IF NOT EXISTS feed_fetches (
@@ -231,6 +232,17 @@ CREATE TABLE IF NOT EXISTS standing_charges (
     fetched_at           TEXT NOT NULL,
     PRIMARY KEY (tariff_code, valid_from)
 );
+
+-- Axle Energy grid events (Events Only mode). The API returns only the next
+-- event, so future rows other than the latest fetched one are pruned; past
+-- rows are kept as history.
+CREATE TABLE IF NOT EXISTS axle_events (
+    start_utc   TEXT NOT NULL PRIMARY KEY,  -- ISO8601 UTC
+    end_utc     TEXT NOT NULL,
+    direction   TEXT NOT NULL,              -- export | import
+    updated_at  TEXT,                       -- Axle's updated_at
+    fetched_at  TEXT NOT NULL
+);
 """
 
 
@@ -243,6 +255,7 @@ CREATE TABLE IF NOT EXISTS standing_charges (
 # (inverter and dhw stamp each row with the moment it was read).
 FEEDS: tuple[tuple[str, str | None], ...] = (
     ("solar", "solar_forecast"),
+    ("axle", None),       # Axle VPP event feed; never stamped (grey) unless AXLE_TOKEN is set
     ("weather", "weather_forecast"),
     ("consumption", "consumption"),
     ("prices", "prices"),
@@ -324,6 +337,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("inverter_readings", "hr_charge_limit", "INTEGER"),
     ("inverter_readings", "hr_discharge_limit", "INTEGER"),
     ("inverter_readings", "hr_eco_mode", "INTEGER"),
+    # schedule — Axle event payment folded into the plan's prices (NULL = none);
+    # buy/sell stay the true tariff so cost accounting is unchanged
+    ("schedule", "axle_uplift_gbp_kwh", "REAL"),
+    ("schedule_history", "axle_uplift_gbp_kwh", "REAL"),
     # actuals — battery flows and SoC endpoints per slot
     ("actuals", "battery_charge_kwh", "REAL"),
     ("actuals", "battery_discharge_kwh", "REAL"),
@@ -342,6 +359,12 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # prices — ex-VAT rates alongside the inc-VAT ones
     ("prices", "buy_exc_vat_gbp_kwh", "REAL"),
     ("prices", "sell_exc_vat_gbp_kwh", "REAL"),
+    # inverter_last_command — trigger of the last write (drift re-assert guard)
+    ("inverter_last_command", "trigger", "TEXT"),
+    # optimizer_runs — load-model settings in force for the run
+    ("optimizer_runs", "half_life_days", "REAL"),
+    ("optimizer_runs", "hdd_base_c", "REAL"),
+    ("optimizer_runs", "train_days", "INTEGER"),
 )
 
 

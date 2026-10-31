@@ -7,34 +7,38 @@ expressed in UTC with BST shifts applied by Octopus, so the records are used
 as-is and slots are matched purely on UTC instants -- never via local hours.
 
 Cache tables (``tariff_rates``, ``tariff_coverage``) are created lazily here
-with ``CREATE TABLE IF NOT EXISTS``; ``octoopt2.db`` is not touched.
+with ``CREATE TABLE IF NOT EXISTS`` in whatever ``--db`` is passed (so always
+pass a copy).  The pure parsing/expansion helpers live in ``octoopt2.data.rates``.
 """
 
 from __future__ import annotations
 
-import bisect
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time
 from typing import Literal
-from zoneinfo import ZoneInfo
 
 import requests
 
+from octoopt2.data.rates import (  # noqa: F401  (re-exported for callers/tests)
+    LONDON,
+    SLOT,
+    UTC,
+    RateRecord,
+    _dedupe,
+    _lookup,
+    expand_rates,
+    expand_standing,
+    london_day_slots,
+    london_days,
+    parse_ts,
+)
 from octoopt2.db import get_conn
 
 API_BASE = "https://api.octopus.energy/v1"
-LONDON = ZoneInfo("Europe/London")
-UTC = timezone.utc
-SLOT = timedelta(minutes=30)
 
 Kind = Literal["unit", "standing"]
 
 _KIND_PATH = {"unit": "standard-unit-rates", "standing": "standing-charges"}
-
-# Payment-method preference when a product publishes both variants for the
-# same valid_from (lower rank wins).
-_PM_RANK = {"DIRECT_DEBIT": 0, None: 1, "": 1, "NON_DIRECT_DEBIT": 2}
-
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -47,14 +51,6 @@ class TariffPair:
     import_product: str | None  # None = use the DB's own prices for buy
     export_product: str | None  # None = db_sell unless sell_fixed given
     sell_fixed: float | None = None  # GBP/kWh constant export override
-
-
-@dataclass(frozen=True)
-class RateRecord:
-    valid_from: datetime  # UTC aware
-    valid_to: datetime | None  # UTC aware, None = open-ended
-    value_gbp: float  # GBP/kWh (unit) or GBP/day (standing); already /100
-    payment_method: str | None
 
 
 @dataclass
@@ -101,18 +97,6 @@ def tariff_code(product_code: str, region: str) -> str:
     return f"E-1R-{product_code}-{region}"
 
 
-def parse_ts(s: str | None) -> datetime | None:
-    """Parse an Octopus ISO timestamp (``...Z`` or ``+00:00``) to UTC aware."""
-    if s is None:
-        return None
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC)
-
-
 def _iso_utc(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
@@ -123,28 +107,6 @@ def _api_period(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%MZ")
-
-
-def london_day_slots(d: date) -> list[datetime]:
-    """UTC-aware half-hour slot starts making up the London calendar day ``d``.
-
-    46 slots on the spring-forward day, 50 on the fall-back day, 48 otherwise.
-    """
-    start = datetime.combine(d, time(0), tzinfo=LONDON).astimezone(UTC)
-    end = datetime.combine(d + timedelta(days=1), time(0), tzinfo=LONDON).astimezone(UTC)
-    out: list[datetime] = []
-    t = start
-    while t < end:
-        out.append(t)
-        t += SLOT
-    return out
-
-
-def london_days(slot_starts: list[datetime]) -> list[date]:
-    seen: dict[date, None] = {}
-    for s in slot_starts:
-        seen[s.astimezone(LONDON).date()] = None
-    return sorted(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -293,64 +255,6 @@ def load_records(db_path: str, tariff_code: str, kind: Kind) -> list[RateRecord]
         )
         for r in rows
     ]
-
-
-# ---------------------------------------------------------------------------
-# Expand
-# ---------------------------------------------------------------------------
-
-
-def _dedupe(records: list[RateRecord]) -> tuple[list[datetime], list[RateRecord]]:
-    """Collapse duplicates per valid_from (DIRECT_DEBIT preferred); sorted."""
-    best: dict[datetime, RateRecord] = {}
-    for r in records:
-        vf = r.valid_from.astimezone(UTC)
-        cur = best.get(vf)
-        if cur is None or _PM_RANK.get(r.payment_method, 1) < _PM_RANK.get(cur.payment_method, 1):
-            best[vf] = r
-    starts = sorted(best)
-    return starts, [best[s] for s in starts]
-
-
-def _lookup(starts: list[datetime], recs: list[RateRecord], t: datetime) -> RateRecord | None:
-    t = t.astimezone(UTC)
-    i = bisect.bisect_right(starts, t) - 1
-    if i < 0:
-        return None
-    rec = recs[i]
-    if rec.valid_to is not None and t >= rec.valid_to:
-        return None
-    return rec
-
-
-def expand_rates(records: list[RateRecord], slot_starts: list[datetime]) -> list[float | None]:
-    """GBP/kWh per slot start, or None where no record covers the slot."""
-    for r in records:
-        vf = r.valid_from.astimezone(UTC)
-        assert vf.minute in (0, 30) and vf.second == 0 and vf.microsecond == 0, (
-            f"valid_from not on a 30-min boundary: {r.valid_from}"
-        )
-    starts, recs = _dedupe(records)
-    out: list[float | None] = []
-    for s in slot_starts:
-        rec = _lookup(starts, recs, s)
-        out.append(None if rec is None else rec.value_gbp)
-    return out
-
-
-def expand_standing(records: list[RateRecord], london_days: list[date]) -> dict[date, float]:
-    """GBP/day keyed by London date (record covering local midnight in UTC).
-
-    Days with no covering record are omitted.
-    """
-    starts, recs = _dedupe(records)
-    out: dict[date, float] = {}
-    for d in london_days:
-        midnight = datetime.combine(d, time(0), tzinfo=LONDON).astimezone(UTC)
-        rec = _lookup(starts, recs, midnight)
-        if rec is not None:
-            out[d] = rec.value_gbp
-    return out
 
 
 # ---------------------------------------------------------------------------

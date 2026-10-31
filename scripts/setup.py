@@ -55,8 +55,8 @@ REQUIRED_VARS = [
     ("OCTOPUS_ACCOUNT_NUMBER",   None,           "Octopus account number"),
     ("OCTOPUS_MPAN",             None,           "Electricity meter MPAN"),
     ("OCTOPUS_SERIAL",           None,           "Electricity meter serial"),
-    ("OCTOPUS_AGILE_TARIFF_CODE",None,           "Agile buy tariff code"),
-    ("OCTOPUS_OUTGOING_TARIFF_CODE", None,       "Agile sell tariff code"),
+    ("OCTOPUS_IMPORT_TARIFF_CODE", None,         "Import (buy) tariff code — Agile or Cosy"),
+    ("OCTOPUS_OUTGOING_TARIFF_CODE", None,       "Export (sell) tariff code"),
     ("OCTOPUS_DNO_REGION",       None,           "DNO region letter"),
     ("SOLCAST_API_KEY",          "xxxx",         "Solcast API key"),
     ("SOLCAST_RESOURCE_ID",      "xxxx",         "Solcast rooftop resource ID"),
@@ -80,6 +80,11 @@ def validate_env() -> bool:
     from dotenv import load_dotenv
     load_dotenv()
 
+    # The app still accepts the pre-Cosy name; mirror it so the check agrees with config.py.
+    if not os.getenv("OCTOPUS_IMPORT_TARIFF_CODE") and os.getenv("OCTOPUS_AGILE_TARIFF_CODE"):
+        os.environ["OCTOPUS_IMPORT_TARIFF_CODE"] = os.environ["OCTOPUS_AGILE_TARIFF_CODE"]
+        warnings.append("OCTOPUS_AGILE_TARIFF_CODE is deprecated — rename it to OCTOPUS_IMPORT_TARIFF_CODE")
+
     for var, placeholder, description in REQUIRED_VARS:
         val = os.getenv(var)
         if not val:
@@ -89,6 +94,8 @@ def validate_env() -> bool:
         else:
             _ok(f"{var}")
 
+    for msg in warnings:
+        _warn(msg)
     for msg in errors:
         _fail(f"Missing / unset: {msg}")
 
@@ -116,7 +123,7 @@ def test_octopus(config) -> bool:
 
         # Check the tariff codes resolve
         for label, tariff_code in [
-            ("buy", config.octopus.agile_tariff_code),
+            ("buy", config.octopus.import_tariff_code),
             ("sell", config.octopus.outgoing_tariff_code),
         ]:
             product_code = tariff_code.split("-")[2:-1]
@@ -263,7 +270,7 @@ def seed_consumption(config, days: int = 30) -> None:
 
 
 def seed_prices(config) -> None:
-    _section("4b. Seeding Agile prices (today + tomorrow)")
+    _section("4b. Seeding import/export prices (today + tomorrow)")
     from octoopt2.data.octopus import fetch_and_store_prices
     today = datetime.now(timezone.utc).date()
     tomorrow = today + timedelta(days=1)
@@ -274,7 +281,7 @@ def seed_prices(config) -> None:
             if n > 0:
                 _ok(f"{d}: {n} price slots fetched")
             else:
-                _warn(f"{d}: no prices returned (tomorrow's prices publish after ~4PM UK time)")
+                _warn(f"{d}: no prices returned (tomorrow's Agile Outgoing rates publish after ~4PM UK time)")
         except Exception as exc:
             _fail(f"{d}: {exc}")
 
@@ -327,9 +334,10 @@ def print_summary(config) -> None:
             count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             _ok(f"{label}: {count} rows")
 
-    model = fit_load_model(config.db_path)
+    model = fit_load_model(config.db_path, config.load_model)
     if model:
-        _ok(f"Load model fitted: α={model.alpha:.4f} kWh/°C, ref={model.ref_temp:.1f}°C, n={model.n_slots} slots")
+        _ok(f"Load model fitted: α={model.alpha:.4f} kWh/°C, ref={model.ref_temp:.1f}°C, "
+            f"hdd_base={model.hdd_base_c}, half_life={model.half_life_days}d, n={model.n_slots} slots")
     else:
         _warn("Load model not fitted — insufficient consumption history (need ≥7 days with weather overlap)")
 
