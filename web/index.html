@@ -40,6 +40,11 @@ header h1 { font-size: 18px; font-weight: 700; color: var(--text); letter-spacin
 .badge-optimal  { background: #14532d; color: var(--green); }
 .badge-infeasible { background: #7f1d1d; color: var(--red); }
 .badge-loading  { background: #1e3a5f; color: var(--blue); }
+.badge-stale    { background: #78350f; color: var(--amber); }
+.stale-banner {
+  background: #78350f; color: #fef3c7; border: 1px solid #b45309; border-radius: 6px;
+  padding: 8px 12px; margin-bottom: 12px; font-size: 12px;
+}
 .header-right { margin-left: auto; display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; }
 .refresh-btn {
   background: var(--surface2); border: 1px solid var(--border); color: var(--text);
@@ -142,6 +147,7 @@ footer { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border
   <header>
     <h1>octoopt2</h1>
     <span id="status-badge" class="badge badge-loading">loading</span>
+    <span id="stale-badge" class="badge badge-stale" style="display:none"></span>
     <span id="header-cost" style="font-size:13px;color:var(--muted)"></span>
     <div class="header-right">
       <a href="status.html" style="font-size:12px">● Live</a>
@@ -238,23 +244,38 @@ function render(data) {
   const cap   = data.battery_capacity_kwh || 9.5;
 
   // Header
+  // Freshness: the daemon re-plans at every half-hour boundary, so a plan
+  // older than ~1.5 slots means the optimizer is not running (or this page is
+  // being served from a stale file). Judge by optimized_at, not generated_at —
+  // the live endpoint stamps generated_at with "now" on every request.
+  // Prefer the server-computed age (live endpoint); fall back to the browser
+  // clock only for a static schedule.json file, which carries no plan_age_s.
+  const planTs   = data.optimized_at || data.generated_at;
+  const planAgeS = typeof data.plan_age_s === 'number'
+    ? data.plan_age_s
+    : (Date.now() - new Date(planTs).getTime()) / 1000;
+  const stale    = !isFinite(planAgeS) || planAgeS > STALE_AFTER_S;
+
   const statusEl = document.getElementById('status-badge');
   statusEl.textContent = data.solver_status || 'Unknown';
   statusEl.className = 'badge ' + (data.solver_status === 'Optimal' ? 'badge-optimal' : 'badge-infeasible');
+  const staleEl = document.getElementById('stale-badge');
+  staleEl.textContent = 'stale plan';
+  staleEl.style.display = stale ? '' : 'none';
 
   const cost = data.total_cost_gbp;
   document.getElementById('header-cost').textContent =
     `Net: ${cost < 0 ? '−' : '+'}£${Math.abs(cost).toFixed(2)}`;
 
   document.getElementById('generated-at').textContent =
-    'Updated ' + formatDateTime(data.generated_at);
+    'Plan from ' + formatDateTime(planTs) + (stale ? ' (' + formatAge(planAgeS) + ' ago)' : '');
 
   // Summary cards
   const totalSolar  = slots.reduce((a, s) => a + s.solar_kwh, 0);
   const totalImport = slots.reduce((a, s) => a + s.grid_import_kwh, 0);
   const totalExport = slots.reduce((a, s) => a + s.grid_export_kwh, 0);
   const currentSlot = slots.find(s => s.is_current);
-  const socNow      = currentSlot ? currentSlot.soc_pct : null;
+  const socNow      = currentSlot && currentSlot.soc_pct != null ? currentSlot.soc_pct : null;
   const dhwCount    = slots.filter(s => s.dhw_on).length;
 
   const costClass2 = cost < -0.0005 ? 'cost-negative' : cost > 0.0005 ? 'cost-positive' : 'cost-zero';
@@ -269,7 +290,7 @@ function render(data) {
     <div class="card">
       <div class="card-label">Battery SoC</div>
       <div class="card-value" style="color:${socNow != null ? socColor(socNow) : 'inherit'}">${socNow != null ? socNow.toFixed(1) + '%' : '—'}</div>
-      <div class="card-sub">${currentSlot ? currentSlot.soc_kwh.toFixed(2) + ' kWh of ' + cap.toFixed(1) + ' kWh' : ''}</div>
+      <div class="card-sub">${socNow != null ? currentSlot.soc_kwh.toFixed(2) + ' kWh of ' + cap.toFixed(1) + ' kWh' : ''}</div>
     </div>
     <div class="card">
       <div class="card-label">Solar forecast</div>
@@ -326,7 +347,7 @@ function render(data) {
     const buyStyle  = priceStyle(s.buy_p);
     const sellStyle = priceStyle(s.sell_p);
     const soc = s.soc_pct;
-    const socFill = `background:${socColor(soc)};width:${Math.min(100,soc)}%`;
+    const socFill = soc == null ? 'width:0' : `background:${socColor(soc)};width:${Math.min(100,soc)}%`;
     const bat = s.bat_charge_kwh > 0.005
       ? `<span style="color:var(--blue)">+${s.bat_charge_kwh.toFixed(3)}</span>`
       : s.bat_discharge_kwh > 0.005
@@ -352,7 +373,7 @@ function render(data) {
       <td>${dhwCell}</td>
       <td>
         <div class="soc-wrap">
-          ${soc.toFixed(0)}%
+          ${soc == null ? '—' : soc.toFixed(0) + '%'}
           <div class="soc-bar-bg"><div class="soc-bar-fill" style="${socFill}"></div></div>
         </div>
       </td>
@@ -361,7 +382,14 @@ function render(data) {
     </tr>`;
   });
 
+  const staleHtml = stale ? `
+    <div class="stale-banner">
+      ⚠ This plan was computed ${formatAge(planAgeS)} ago (${formatDateTime(planTs)}). The optimizer
+      re-plans every half hour, so the daemon is probably not running or not saving schedules.
+      Prices and forecasts below may be out of date — check the <a href="status.html">live status</a> page.
+    </div>` : '';
   document.getElementById('app').innerHTML = `
+    ${staleHtml}
     <div class="cards">${cards}</div>
     ${ydayHtml}
     ${dhwHtml}
@@ -385,6 +413,17 @@ function render(data) {
 // ── Load & auto-refresh ──────────────────────────────────────────────────────
 
 let countdown = 300;
+// A plan older than this is flagged as stale (plans are recomputed every 30 min).
+const STALE_AFTER_S = 45 * 60;
+
+function formatAge(seconds) {
+  if (!isFinite(seconds)) return 'an unknown time';
+  const m = Math.round(seconds / 60);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h} h ${m % 60} min`;
+  return `${Math.floor(h / 24)} days`;
+}
 
 function tick() {
   countdown--;
@@ -405,11 +444,13 @@ function loadData() {
       document.getElementById('app').innerHTML = `
         <div class="state-msg">
           <h2>No data</h2>
-          <p>Run <code>uv run octoopt2 --output</code> to generate schedule.json</p>
+          <p>No saved plan yet. The daemon serves this page from its last optimization;
+             with the cron model, run <code>uv run octoopt2 --output</code> to write schedule.json.</p>
           <p style="margin-top:8px;color:#64748b;font-size:11px">${err}</p>
         </div>`;
       const sb = document.getElementById('status-badge');
       sb.textContent = 'no data'; sb.className = 'badge badge-loading';
+      document.getElementById('stale-badge').style.display = 'none';
     });
 }
 

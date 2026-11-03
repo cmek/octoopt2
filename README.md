@@ -274,7 +274,8 @@ manual `uv run octoopt2 --dry-run`) between polls. A single internal lock keeps 
 > The daemon **replaces** cron. Remove any `*/5 * * * * … uv run octoopt2` crontab
 > line before starting it — the two cannot run simultaneously (single connection).
 
-Flags: `--no-dhw` (see below), `--output` (write `web/schedule.json` each tick),
+Flags: `--no-dhw` (see below), `--output` (also write `web/schedule.json` each
+tick, only needed for an external static web server — see *Live dashboard*),
 `--dry-run` (optimize and poll, but send no commands), `--metrics-port N`.
 
 Supervise it however you like (systemd, tmux, `nohup`, a container). It logs to
@@ -356,9 +357,20 @@ short in-memory history of inverter readings:
 - **data-feed freshness** indicators.
 
 It auto-refreshes every 5 s from `/status.json` (served same-origin, so no
-Prometheus query API or CORS setup is needed). The server also serves the existing
+Prometheus query API or CORS setup is needed). The server also serves the
 `/index.html` (schedule) and `/accuracy.html` pages, so a single port covers
 metrics and all three dashboards.
+
+The schedule page reads `/schedule.json`, which the daemon builds on every
+request from the newest saved plan in the database (`schedule_history` plus the
+matching `optimizer_runs` row) — it is never read from a file, so it cannot go
+stale while the daemon is running. The page flags the plan as **stale** when
+`optimized_at` is more than 45 minutes old (by the server's clock), which means
+the optimizer tick is not completing. `--output` still writes a static
+`web/schedule.json` for setups that serve `web/` through another web server.
+Under `--dry-run` nothing is saved, so the built-in page keeps showing the last
+real plan (and flags it stale after 45 min); use `--dry-run --output` and open
+`web/schedule.json` directly to inspect a dry-run plan.
 
 ### Cron job (legacy)
 

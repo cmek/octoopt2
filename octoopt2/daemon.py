@@ -53,6 +53,7 @@ from .data.inverter import InverterReading, read_inverter, store_reading
 from .db import init_db
 from .metrics import OctooptCollector
 from .status import build_status
+from .webplan import build_schedule_from_db
 from . import scheduler
 
 logging.basicConfig(
@@ -90,12 +91,12 @@ class DaemonState:
 # ── HTTP server (metrics + live dashboard) ──────────────────────────────────
 
 # Directory holding the dashboard's static assets (status.html etc.), resolved
-# relative to the working directory like the optimizer's web/schedule.json output.
+# relative to the working directory.
 _WEB_DIR = Path("web")
 
 
-def _make_handler(state: "DaemonState", config: AppConfig):
-    """Build a request handler serving /metrics, /status.json, and web/ statics."""
+def _make_handler(state: "DaemonState", config: AppConfig, manage_dhw: bool = True):
+    """Build a request handler serving /metrics, /status.json, /schedule.json and web/ statics."""
     web_root = _WEB_DIR.resolve()
 
     class Handler(BaseHTTPRequestHandler):
@@ -124,25 +125,43 @@ def _make_handler(state: "DaemonState", config: AppConfig):
             ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
             self._send(200, ctype, body)
 
+        def _send_json(self, build, name: str, missing: str) -> None:
+            """Serve build()'s dict as JSON: 500 on exception, 404 (`missing`) on None."""
+            try:
+                payload = build()
+            except Exception as exc:
+                logger.warning("%s build failed: %s", name, exc)
+                self._send(
+                    500, "application/json",
+                    json.dumps({"error": str(exc)}).encode(), cache=False,
+                )
+                return
+            if payload is None:
+                self._send(404, "application/json", json.dumps({"error": missing}).encode(), cache=False)
+                return
+            self._send(200, "application/json", json.dumps(payload).encode(), cache=False)
+
         def do_GET(self) -> None:
             path = self.path.split("?", 1)[0]
             if path == "/metrics":
                 self._send(200, CONTENT_TYPE_LATEST, generate_latest(REGISTRY), cache=False)
                 return
+            if path == "/schedule.json":
+                # Built live from the saved plan, never from a file on disk —
+                # a stale web/schedule.json once served June prices in November.
+                self._send_json(
+                    lambda: build_schedule_from_db(config, manage_dhw),
+                    "schedule.json", missing="no schedule saved yet",
+                )
+                return
             if path == "/status.json":
-                try:
-                    payload = build_status(
+                self._send_json(
+                    lambda: build_status(
                         state, config.db_path, config.battery.capacity_kwh, dhw_cfg=config.dhw,
                         axle_cfg=config.axle,
-                    )
-                    body = json.dumps(payload).encode()
-                    self._send(200, "application/json", body, cache=False)
-                except Exception as exc:
-                    logger.warning("status.json build failed: %s", exc)
-                    self._send(
-                        500, "application/json",
-                        json.dumps({"error": str(exc)}).encode(), cache=False,
-                    )
+                    ),
+                    "status.json", missing="no status",
+                )
                 return
             rel = path.lstrip("/") or "status.html"
             self._serve_static(rel)
@@ -152,9 +171,9 @@ def _make_handler(state: "DaemonState", config: AppConfig):
     return Handler
 
 
-def _start_http_server(state: "DaemonState", config: AppConfig) -> None:
+def _start_http_server(state: "DaemonState", config: AppConfig, manage_dhw: bool = True) -> None:
     """Start the combined metrics + dashboard HTTP server in a background thread."""
-    handler = _make_handler(state, config)
+    handler = _make_handler(state, config, manage_dhw)
     httpd = ThreadingHTTPServer(("", config.daemon.metrics_port), handler)
     thread = threading.Thread(target=httpd.serve_forever, name="http", daemon=True)
     thread.start()
@@ -334,7 +353,7 @@ async def _run(
     state = DaemonState()
 
     REGISTRY.register(OctooptCollector(state, config.db_path))
-    _start_http_server(state, config)
+    _start_http_server(state, config, manage_dhw)
     logger.info(
         "HTTP server listening on :%d — /metrics, /status.json, dashboard at /",
         config.daemon.metrics_port,
@@ -419,7 +438,12 @@ def main() -> None:
     parser.add_argument(
         "--output",
         action="store_true",
-        help="Write optimizer result to web/schedule.json on each tick",
+        help=(
+            "Also write web/schedule.json on each tick for an external static web server. "
+            "Not needed for the built-in dashboard, which serves /schedule.json live from the "
+            "saved plan (so under --dry-run, which saves nothing, the built-in page keeps "
+            "showing the last real plan). Note: forces a full optimization every tick."
+        ),
     )
     parser.add_argument(
         "--dry-run",

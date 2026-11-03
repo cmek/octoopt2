@@ -12,3 +12,7 @@ wheels/
 # Environment / secrets — never commit
 .env
 *.db
+*.db.backup
+*.db-journal
+*.db-wal
+*.db-shm
