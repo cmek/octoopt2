@@ -233,6 +233,13 @@ CREATE TABLE IF NOT EXISTS standing_charges (
     PRIMARY KEY (tariff_code, valid_from)
 );
 
+-- Small key/value store for bookkeeping that is not a feed stamp, e.g. the
+-- tariff codes the stored prices were fetched under (see data/octopus.py).
+CREATE TABLE IF NOT EXISTS meta (
+    key    TEXT NOT NULL PRIMARY KEY,
+    value  TEXT
+);
+
 -- Axle Energy grid events (Events Only mode). The API returns only the next
 -- event, so future rows other than the latest fetched one are pruned; past
 -- rows are kept as history.
@@ -405,6 +412,22 @@ def record_fetch(db_path: str, feed: str, now: datetime | None = None) -> None:
             )
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("Could not record fetch for feed %s: %s", feed, exc)
+
+
+def get_meta(db_path: str, key: str) -> str | None:
+    """Value stored under `key` in the meta table, or None."""
+    with get_conn(db_path) as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return None if row is None else row["value"]
+
+
+def set_meta(db_path: str, key: str, value: str | None) -> None:
+    with get_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
 
 
 def age_seconds(iso_ts: str | None, now: datetime) -> float | None:

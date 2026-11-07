@@ -185,6 +185,7 @@ All data is stored in a local SQLite database (WAL mode). Tables:
 | `weather_forecast` | Open-Meteo 15-min temperature, cloud, wind, humidity, precipitation |
 | `inverter_readings` | Point-in-time inverter snapshots (every 5 min) |
 | `feed_fetches` | Last successful refresh per data feed (backs `octoopt2_feed_age_seconds`) |
+| `meta` | Key/value bookkeeping, e.g. the tariff codes the stored prices were fetched under (a change in `.env` refetches today's and tomorrow's prices on the next refresh) |
 | `schedule` | Latest optimizer plan per slot |
 | `actuals` | Measured outcomes per completed slot (aggregated from inverter readings) |
 

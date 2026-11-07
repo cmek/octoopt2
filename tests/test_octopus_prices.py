@@ -230,3 +230,70 @@ def test_import_tariff_env_new_name_wins(monkeypatch):
     _env(monkeypatch, OCTOPUS_IMPORT_TARIFF_CODE="E-1R-COSY-22-12-08-G",
          OCTOPUS_AGILE_TARIFF_CODE="E-1R-AGILE-24-10-01-G")
     assert OctopusConfig.from_env().import_tariff_code == "E-1R-COSY-22-12-08-G"
+
+
+# ── tariff switch: stored prices must be refetched under the new codes ──────
+
+def agile_cfg() -> OctopusConfig:
+    return OctopusConfig(
+        api_key="k", account_number="a", mpan="m", serial="s",
+        import_tariff_code="E-1R-AGILE-24-10-01-G",
+        outgoing_tariff_code="E-1R-AGILE-OUTGOING-19-05-13-G",
+        dno_region="G",
+    )
+
+
+def test_missing_price_dates_without_stamp_treats_window_as_stale(db, monkeypatch):
+    """A DB from before the stamp existed (or whose prices came from an unknown
+    tariff) refetches the whole window once a config is supplied; the legacy
+    call without a config is unchanged."""
+    today = datetime.now(O.LONDON).date()
+    _patch_fetch(monkeypatch, {"E-1R-COSY-22-12-08-G": cosy_day(today),
+                               "E-1R-AGILE-OUTGOING-19-05-13-G": agile_window(today, 15.0)})
+    O.fetch_and_store_prices(cfg(), db, for_date=today)
+    assert O.missing_price_dates(db, look_ahead_days=2) == [today + timedelta(days=1)]
+    assert O.price_tariffs_changed(db, cfg())
+    assert O.missing_price_dates(db, look_ahead_days=2, config=cfg()) == [today, today + timedelta(days=1)]
+    O.record_price_tariffs(db, cfg())
+    assert not O.price_tariffs_changed(db, cfg())
+    assert O.missing_price_dates(db, look_ahead_days=2, config=cfg()) == [today + timedelta(days=1)]
+
+
+def test_tariff_switch_replaces_todays_stored_buy_prices(db, monkeypatch):
+    """Agile → Cosy mid-day: today's slots already hold Agile buy prices and a
+    full set of sell rates, so nothing looks missing — yet the plan must use
+    Cosy from the next refresh, not from tomorrow."""
+    today = datetime.now(O.LONDON).date()
+    tomorrow = today + timedelta(days=1)
+    _patch_fetch(monkeypatch, {"E-1R-AGILE-24-10-01-G": agile_window(today, 20.0),
+                               "E-1R-AGILE-OUTGOING-19-05-13-G": agile_window(today, 15.0)})
+    O.fetch_and_store_prices(agile_cfg(), db, for_date=today)
+    O.record_price_tariffs(db, agile_cfg())
+    assert O.missing_price_dates(db, look_ahead_days=2, config=agile_cfg()) == [tomorrow]
+    assert all(r["buy_gbp_kwh"] == pytest.approx(0.20) for r in _rows(db))
+
+    # .env now names Cosy: today is stale and must be refetched
+    assert O.price_tariffs_changed(db, cfg())
+    assert O.missing_price_dates(db, look_ahead_days=2, config=cfg()) == [today, tomorrow]
+    _patch_fetch(monkeypatch, {"E-1R-COSY-22-12-08-G": cosy_day(today),
+                               "E-1R-AGILE-OUTGOING-19-05-13-G": agile_window(today, 15.0)})
+    O.fetch_and_store_prices(cfg(), db, for_date=today)
+    O.record_price_tariffs(db, cfg())
+    peak = utc(today.year, today.month, today.day, 17, 0)
+    by_slot = {r["slot_start"]: r["buy_gbp_kwh"] for r in _rows(db)}
+    assert by_slot[peak.isoformat()] == pytest.approx(PEAK / 100)
+    assert all(r["sell_gbp_kwh"] == pytest.approx(0.15) for r in _rows(db))
+    # tomorrow is still outstanding (not published), today is not
+    assert O.missing_price_dates(db, look_ahead_days=2, config=cfg()) == [tomorrow]
+
+
+def test_outgoing_switch_alone_also_refetches(db):
+    O.record_price_tariffs(db, cfg())
+    other = OctopusConfig(
+        api_key="k", account_number="a", mpan="m", serial="s",
+        import_tariff_code="E-1R-COSY-22-12-08-G",
+        outgoing_tariff_code="E-1R-OUTGOING-FIX-12M-19-05-13-G",
+        dno_region="G",
+    )
+    assert O.price_tariffs_changed(db, other)
+    assert not O.price_tariffs_changed(db, cfg())
