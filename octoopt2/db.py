@@ -348,6 +348,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # buy/sell stay the true tariff so cost accounting is unchanged
     ("schedule", "axle_uplift_gbp_kwh", "REAL"),
     ("schedule_history", "axle_uplift_gbp_kwh", "REAL"),
+    # schedule — the plan's SoC path per slot (HOLD mode uses soc_end_kwh as
+    # its reserve); NULL on rows written before the upgrade
+    ("schedule", "soc_start_kwh", "REAL"),
+    ("schedule", "soc_end_kwh", "REAL"),
     # actuals — battery flows and SoC endpoints per slot
     ("actuals", "battery_charge_kwh", "REAL"),
     ("actuals", "battery_discharge_kwh", "REAL"),

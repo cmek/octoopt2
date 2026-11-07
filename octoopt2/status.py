@@ -22,13 +22,13 @@ LONDON = ZoneInfo("Europe/London")
 _ONLINE_MAX_AGE_S = 150.0
 
 
-def _slot_mode(charge_kwh: float, discharge_kwh: float, export_kwh: float) -> str:
+def _slot_mode(charge_kwh: float, discharge_kwh: float, export_kwh: float, idle_mode: str = "eco") -> str:
     """Human label for the planned battery action in a slot."""
     if charge_kwh > 0.05:
         return "CHARGE"
     if discharge_kwh > 0.05:
         return "DISCHARGE/EXPORT" if export_kwh > 0.05 else "DISCHARGE/DEMAND"
-    return "ECO"
+    return "HOLD" if idle_mode == "hold" else "ECO"
 
 
 def _live(state, now: datetime) -> dict:
@@ -89,7 +89,7 @@ def _dhw(state, now: datetime, dhw_cfg=None) -> dict:
     }
 
 
-def _planner_and_cost(db_path: str, now: datetime) -> tuple[dict, dict, list]:
+def _planner_and_cost(db_path: str, now: datetime, idle_mode: str = "eco") -> tuple[dict, dict, list]:
     """Current slot decision, cost summary, and an upcoming price/plan strip."""
     slot_start = now.replace(minute=(now.minute // 30) * 30, second=0, microsecond=0)
 
@@ -120,6 +120,7 @@ def _planner_and_cost(db_path: str, now: datetime) -> tuple[dict, dict, list]:
                     row["battery_charge_kwh"],
                     row["battery_discharge_kwh"],
                     row["grid_export_kwh"],
+                    idle_mode,
                 ),
                 "dhw_on": bool(row["dhw_on"]),
                 "planned": {
@@ -160,7 +161,7 @@ def _planner_and_cost(db_path: str, now: datetime) -> tuple[dict, dict, list]:
                 "buy_p": round(r["buy_gbp_kwh"] * 100, 2),
                 "sell_p": round(r["sell_gbp_kwh"] * 100, 2),
                 "mode": _slot_mode(
-                    r["battery_charge_kwh"], r["battery_discharge_kwh"], r["grid_export_kwh"]
+                    r["battery_charge_kwh"], r["battery_discharge_kwh"], r["grid_export_kwh"], idle_mode
                 ),
                 "dhw_on": bool(r["dhw_on"]),
                 "is_current": r["slot_start"] == slot_start.isoformat(),
@@ -244,12 +245,12 @@ def _history(state) -> list:
 
 def build_status(
     state, db_path: str, capacity_kwh: float, now: datetime | None = None, dhw_cfg=None,
-    axle_cfg=None,
+    axle_cfg=None, idle_mode: str = "eco",
 ) -> dict:
     """Assemble the full live status snapshot for the dashboard."""
     if now is None:
         now = datetime.now(timezone.utc)
-    planner, cost, upcoming = _planner_and_cost(db_path, now)
+    planner, cost, upcoming = _planner_and_cost(db_path, now, idle_mode)
     return {
         "now": now.isoformat(),
         "battery_capacity_kwh": capacity_kwh,

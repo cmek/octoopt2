@@ -65,6 +65,8 @@ def main() -> None:
     ap.add_argument("--max-discharge-kw", type=float, default=None)
     ap.add_argument("--max-export-kw", type=float, default=float(os.getenv("MAX_EXPORT_KW", "3.6")))
     ap.add_argument("--terminal", choices=["value", "end-as-start", "none"], default="value")
+    ap.add_argument("--idle-mode", choices=["eco", "hold"], default=None,
+                    help="what idle plan slots do in the simulator/replay (default: BATTERY_IDLE_MODE from .env)")
     ap.add_argument("--lookahead-days", type=int, default=1)
     ap.add_argument("--time-limit", type=int, default=60)
     ap.add_argument("--dhw-replay", type=float, default=None, metavar="BETA_KWH", help="let the MILP re-place DHW (subtract BETA on planned DHW slots)")
@@ -79,6 +81,8 @@ def main() -> None:
     ap.add_argument("--load-train-days", type=int, default=None)
     ap.add_argument("--load-temp", choices=["observed", "forecast"], default="observed", help="temperature source for --replay-load model")
     ap.add_argument("--solar-scale", type=float, default=1.0, help="multiply the replay's solar forecast")
+    ap.add_argument("--replay-horizon", choices=["auto", "agile", "banded"], default="auto",
+                    help="replay price horizon: auto = per day from the price structure (banded days see 23:00 tomorrow)")
     ap.add_argument("--axle-events", default=None, metavar="PATH",
                     help="JSON list of Axle events [{start_time,end_time,import_export}]; their payment is added to every strategy's prices")
     ap.add_argument("--refresh-tariffs", action="store_true")
@@ -98,6 +102,8 @@ def main() -> None:
         overrides["max_charge_rate_kw"] = args.max_charge_kw
     if args.max_discharge_kw is not None:
         overrides["max_discharge_rate_kw"] = args.max_discharge_kw
+    if args.idle_mode is not None:
+        overrides["idle_mode"] = args.idle_mode
     if overrides:
         from dataclasses import replace
         battery = replace(battery, **overrides)
@@ -176,7 +182,8 @@ def main() -> None:
 
     rolling = RollingOptions(replan_every=args.replan_every, time_limit_s=min(args.time_limit, 20),
                              solar_scale=args.solar_scale, solar_source=args.replay_solar,
-                             load_source=args.replay_load, terminal=args.terminal) if args.replay else None
+                             load_source=args.replay_load, terminal=args.terminal,
+                             horizon=args.replay_horizon) if args.replay else None
 
     results = []
     for pair in pairs:

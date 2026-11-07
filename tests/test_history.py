@@ -13,7 +13,9 @@ from octoopt2.data.inverter import InverterReading, get_latest_reading, store_re
 from octoopt2.db import get_conn, init_db
 from octoopt2.optimizer.forecast import _load_gross_load
 from octoopt2.optimizer.model import OptimizerInput, OptimizerResult, SlotDecision
-from octoopt2.optimizer.schedule import record_optimizer_run, save_schedule
+from octoopt2.optimizer.schedule import (
+    get_current_decision, get_upcoming_schedule, record_optimizer_run, save_schedule,
+)
 
 T0 = datetime(2026, 10, 12, 10, 0, tzinfo=timezone.utc)
 
@@ -247,3 +249,16 @@ def test_gross_load_sql_bucketing_matches_mean(db_path):
 
     # Readings older than TRAINING_DAYS are excluded.
     assert _load_gross_load(db_path, now=T0 + timedelta(days=60)) == {}
+
+
+def test_schedule_round_trips_planned_soc(db_path):
+    result, inputs = _result(T0 - timedelta(minutes=10))
+    save_schedule(result, inputs, db_path)
+    d = get_current_decision(db_path, now=T0 + timedelta(minutes=5))
+    assert (d.soc_start_kwh, d.soc_end_kwh) == (2.0, 3.0)
+    assert [u.soc_end_kwh for u in get_upcoming_schedule(db_path, from_dt=T0, limit=3)] == [3.0, 4.0, 5.0]
+    # rows written before the columns existed read back as 0.0, not None
+    with get_conn(db_path) as conn:
+        conn.execute("UPDATE schedule SET soc_start_kwh = NULL, soc_end_kwh = NULL")
+    d = get_current_decision(db_path, now=T0 + timedelta(minutes=5))
+    assert (d.soc_start_kwh, d.soc_end_kwh) == (0.0, 0.0)

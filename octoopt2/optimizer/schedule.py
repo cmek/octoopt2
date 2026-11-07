@@ -37,6 +37,8 @@ def save_schedule(
             inputs.sell_prices[t],
             optimized_at,
             uplift[t] or None,
+            decision.soc_start_kwh,
+            decision.soc_end_kwh,
         ))
         history_rows.append((
             rows[-1][0],
@@ -65,8 +67,9 @@ def save_schedule(
                 slot_start, battery_charge_kwh, battery_discharge_kwh,
                 grid_import_kwh, grid_export_kwh, dhw_on,
                 predicted_load_kwh, predicted_solar_kwh,
-                buy_gbp_kwh, sell_gbp_kwh, optimized_at, axle_uplift_gbp_kwh
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                buy_gbp_kwh, sell_gbp_kwh, optimized_at, axle_uplift_gbp_kwh,
+                soc_start_kwh, soc_end_kwh
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(slot_start) DO UPDATE SET
                 battery_charge_kwh    = excluded.battery_charge_kwh,
                 battery_discharge_kwh = excluded.battery_discharge_kwh,
@@ -78,7 +81,9 @@ def save_schedule(
                 buy_gbp_kwh           = excluded.buy_gbp_kwh,
                 sell_gbp_kwh          = excluded.sell_gbp_kwh,
                 optimized_at          = excluded.optimized_at,
-                axle_uplift_gbp_kwh   = excluded.axle_uplift_gbp_kwh
+                axle_uplift_gbp_kwh   = excluded.axle_uplift_gbp_kwh,
+                soc_start_kwh         = excluded.soc_start_kwh,
+                soc_end_kwh           = excluded.soc_end_kwh
             """,
             rows,
         )
@@ -156,7 +161,7 @@ def get_current_decision(db_path: str, now: datetime | None = None) -> SlotDecis
             SELECT slot_start, battery_charge_kwh, battery_discharge_kwh,
                    grid_import_kwh, grid_export_kwh, dhw_on,
                    predicted_load_kwh, predicted_solar_kwh,
-                   buy_gbp_kwh, sell_gbp_kwh
+                   buy_gbp_kwh, sell_gbp_kwh, soc_start_kwh, soc_end_kwh
             FROM schedule
             WHERE slot_start = ?
             """,
@@ -174,8 +179,11 @@ def get_current_decision(db_path: str, now: datetime | None = None) -> SlotDecis
         grid_import_kwh=row["grid_import_kwh"],
         grid_export_kwh=row["grid_export_kwh"],
         dhw_on=bool(row["dhw_on"]),
-        soc_start_kwh=0.0,   # not stored — use inverter reading for actual SoC
-        soc_end_kwh=0.0,
+        # Planned SoC path (NULL on rows written before the columns existed).
+        # The live SoC comes from the inverter reading; this is what the plan
+        # assumed, which HOLD mode uses as its reserve.
+        soc_start_kwh=row["soc_start_kwh"] or 0.0,
+        soc_end_kwh=row["soc_end_kwh"] or 0.0,
         slot_cost_gbp=cost,
     )
 
@@ -195,7 +203,7 @@ def get_upcoming_schedule(
             """
             SELECT slot_start, battery_charge_kwh, battery_discharge_kwh,
                    grid_import_kwh, grid_export_kwh, dhw_on,
-                   buy_gbp_kwh, sell_gbp_kwh
+                   buy_gbp_kwh, sell_gbp_kwh, soc_start_kwh, soc_end_kwh
             FROM schedule
             WHERE slot_start >= ?
             ORDER BY slot_start
@@ -212,8 +220,8 @@ def get_upcoming_schedule(
             grid_import_kwh=r["grid_import_kwh"],
             grid_export_kwh=r["grid_export_kwh"],
             dhw_on=bool(r["dhw_on"]),
-            soc_start_kwh=0.0,
-            soc_end_kwh=0.0,
+            soc_start_kwh=r["soc_start_kwh"] or 0.0,
+            soc_end_kwh=r["soc_end_kwh"] or 0.0,
             slot_cost_gbp=r["buy_gbp_kwh"] * r["grid_import_kwh"]
                 - r["sell_gbp_kwh"] * r["grid_export_kwh"],
         )

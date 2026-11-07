@@ -205,3 +205,57 @@ def test_drift_reassert_rewrites_slot_window(db, sent):
     assert len(sent) == 2
     assert int(HR.DISCHARGE_SLOT_1_START) in _writes(sent[-1])          # window rewritten, not just the limit
     assert _writes(sent[-1])[int(HR.BATTERY_DISCHARGE_LIMIT)] == reg
+
+
+# ── HOLD mode (BATTERY_IDLE_MODE=hold) ───────────────────────────────────────
+
+from dataclasses import replace as _replace
+
+HOLD_BAT = BatteryConfig(hw_reserve_pct=10, idle_mode="hold")
+
+
+def _idle(soc_end: float) -> SlotDecision:
+    return _replace(_decision(), soc_end_kwh=soc_end)
+
+
+def test_decision_to_mode_hold_only_for_idle_slots():
+    assert ci.decision_to_mode(_idle(7.6), HOLD_BAT) == ("HOLD", 0.0)
+    assert ci.decision_to_mode(_decision(charge=1.0), HOLD_BAT) == ("CHARGE", 2.0)
+    assert ci.decision_to_mode(_decision(discharge=1.0, export=0.5), HOLD_BAT) == ("DISCHARGE_EXPORT", 2.0)
+    # discharge-to-load stays dynamic self-use even in hold mode
+    assert ci.decision_to_mode(_decision(discharge=1.0), HOLD_BAT) == ("ECO", 0.0)
+    # default config never produces HOLD
+    assert ci.decision_to_mode(_idle(7.6), BAT) == ("ECO", 0.0)
+
+
+def test_hold_reserve_is_planned_soc_clamped():
+    assert ci.hold_reserve_pct(_idle(7.6), HOLD_BAT) == 80
+    assert ci.hold_reserve_pct(_idle(0.5), HOLD_BAT) == 10      # never below the hw floor
+    assert ci.hold_reserve_pct(_idle(9.5), HOLD_BAT) == 100
+    assert ci.hold_reserve_pct(_idle(0.0), HOLD_BAT) == 10      # pre-upgrade rows (NULL → 0)
+
+
+def test_registers_consistent_hold():
+    now = datetime.now(timezone.utc)
+    held = {**ECO_OK, "hr_soc_reserve": 80, "hr_power_reserve": 80}
+    assert ci.registers_consistent("HOLD", 80, _reading(now, **held), 10) is True
+    assert ci.registers_consistent("HOLD", 80, _reading(now, **ECO_OK), 10) is False
+
+
+def test_apply_decision_hold_writes_reserve_once_then_eco_restores_floor(db, sent):
+    ci.apply_decision(_idle(7.6), GE, HOLD_BAT, db, trigger="slow")
+    w = _writes(sent[0])
+    assert w[int(HR.BATTERY_SOC_RESERVE)] == 80
+    assert w[int(HR.BATTERY_DISCHARGE_MIN_POWER_RESERVE)] == 80
+    assert w[int(HR.ECO_MODE)] == 1
+    assert w[int(HR.ENABLE_CHARGE)] is False and w[int(HR.ENABLE_DISCHARGE)] is False
+    # same slot, same plan → no repeat write
+    ci.apply_decision(_idle(7.6), GE, HOLD_BAT, db, trigger="fast")
+    assert len(sent) == 1
+    # the plan's SoC moved (next slot) → one more write at the new level
+    ci.apply_decision(_idle(8.55), GE, HOLD_BAT, db, trigger="slow")
+    assert len(sent) == 2 and _writes(sent[1])[int(HR.BATTERY_SOC_RESERVE)] == 90
+    # an ECO slot afterwards puts the hardware floor back
+    ci.apply_decision(_decision(discharge=1.0), GE, HOLD_BAT, db, trigger="slow")
+    assert len(sent) == 3 and _writes(sent[2])[int(HR.BATTERY_SOC_RESERVE)] == 10
+    assert ci._load_last_command(db).mode == "ECO"

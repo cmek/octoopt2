@@ -355,7 +355,7 @@ def _print_dry_run(result, inputs, now: datetime, config: AppConfig, manage_dhw:
             else:
                 mode = f"DISCHARGE/DEMAND r={reg}/50"
         else:
-            mode = "ECO"
+            mode = "HOLD" if config.battery.idle_mode == "hold" else "ECO"
 
         soc_pct = d.soc_end_kwh / config.battery.capacity_kwh * 100
         slot_cost = d.slot_cost_gbp
@@ -461,7 +461,7 @@ def _write_web_output(result, inputs, now: datetime, config: AppConfig, manage_d
                 else f"DISCHARGE/DEMAND r={reg}/50"
             )
         else:
-            mode = "ECO"
+            mode = "HOLD" if config.battery.idle_mode == "hold" else "ECO"
 
         slots.append({
             "slot_start":        d.slot_start.astimezone(timezone.utc).isoformat(),
@@ -559,10 +559,10 @@ def _refresh_feeds(config: AppConfig, now: datetime) -> None:
     tariffs_changed = False
     try:
         tariffs_changed = price_tariffs_changed(config.db_path, config.octopus)
-        for d in missing_price_dates(config.db_path, look_ahead_days=2, config=config.octopus):
+        for d in missing_price_dates(config.db_path, look_ahead_days=2, config=config.octopus, now=now):
             n = fetch_and_store_prices(config.octopus, config.db_path, for_date=d)
-            if n == 0 and d > now.date():
-                logger.info("Tomorrow's prices not published yet")
+            if n == 0 and d > now.astimezone(LONDON).date():
+                logger.info("Tomorrow's import prices not published yet")
         # Stamped for the whole cycle rather than inside fetch_and_store_prices:
         # prices are fetched only for dates missing from the DB, so on most ticks
         # there is no call at all. "Refresh completed, nothing outstanding" is the
@@ -647,10 +647,11 @@ def _remaining_slots(db_path: str, now: datetime) -> list[datetime]:
     """Return upcoming 30-min slots that have price data.
 
     Starts from the slot containing now, ends at the last slot with buy price
-    data in the DB, capped at 48 h: typically 23:00 UK time tomorrow on Agile,
-    the full 48 h on a banded tariff such as Cosy (rates are published months
-    ahead). Slots whose Outgoing rate is not yet published get the pessimistic
-    ``min(buy, last published sell)`` fallback in ``run``.
+    data in the DB, capped at 48 h. The feed keeps today's and tomorrow's
+    pricing days, so this is 23:00 UK tomorrow on a banded tariff such as Cosy
+    at any time of day, and on Agile from ~16:00 (23:00 today before that);
+    the 48 h cap never binds. Slots whose Outgoing rate is not yet published
+    get the pessimistic ``min(buy, last published sell)`` fallback in ``run``.
     """
     # Round down to current slot boundary
     current_slot = now.replace(

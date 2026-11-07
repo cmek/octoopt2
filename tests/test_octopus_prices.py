@@ -297,3 +297,87 @@ def test_outgoing_switch_alone_also_refetches(db):
     )
     assert O.price_tariffs_changed(db, other)
     assert not O.price_tariffs_changed(db, cfg())
+
+
+# ── Tomorrow's export rate: not re-polled before 15:30 on a banded tariff ────
+
+D = date(2026, 11, 10)
+D1 = D + timedelta(days=1)
+
+
+def L(h, m=0):
+    return datetime(2026, 11, 10, h, m, tzinfo=O.LONDON)
+
+
+def _seed_cosy(db, monkeypatch, *, today_sell=True, tomorrow=True):
+    """Cosy today (optionally with its export rate) and Cosy-only tomorrow
+    (export not published), stamped as fetched under the Cosy config."""
+    bt = {"E-1R-COSY-22-12-08-G": cosy_day(D)}
+    if today_sell:
+        bt["E-1R-AGILE-OUTGOING-19-05-13-G"] = agile_window(D, 15.0)
+    _patch_fetch(monkeypatch, bt)
+    O.fetch_and_store_prices(cfg(), db, for_date=D)
+    if tomorrow:
+        _patch_fetch(monkeypatch, {"E-1R-COSY-22-12-08-G": cosy_day(D1)})
+        O.fetch_and_store_prices(cfg(), db, for_date=D1)
+    O.record_price_tariffs(db, cfg())
+
+
+def _missing(db, now, config=None):
+    return O.missing_price_dates(db, look_ahead_days=2, config=config or cfg(), now=now)
+
+
+def test_missing_price_dates_holds_future_null_sell_before_1530(db, monkeypatch):
+    _seed_cosy(db, monkeypatch)
+    assert _missing(db, L(10)) == []
+    assert _missing(db, L(15, 29)) == []
+    assert _missing(db, L(15, 30)) == [D1]
+    assert _missing(db, L(16, 30)) == [D1]
+
+
+def test_missing_price_dates_today_null_sell_is_always_missing(db, monkeypatch):
+    _seed_cosy(db, monkeypatch, today_sell=False, tomorrow=False)
+    assert _missing(db, L(10)) == [D, D1]
+
+
+def test_missing_price_dates_absent_tomorrow_always_missing_on_agile(db, monkeypatch):
+    _patch_fetch(monkeypatch, {"E-1R-AGILE-24-10-01-G": agile_window(D, 20.0),
+                               "E-1R-AGILE-OUTGOING-19-05-13-G": agile_window(D, 15.0)})
+    O.fetch_and_store_prices(agile_cfg(), db, for_date=D)
+    O.record_price_tariffs(db, agile_cfg())
+    assert _missing(db, L(10), agile_cfg()) == [D1]
+    assert _missing(db, L(16, 30), agile_cfg()) == [D1]
+
+
+def test_missing_price_dates_incomplete_buy_rows_refetched(db, monkeypatch):
+    _seed_cosy(db, monkeypatch)
+    pf, _ = O._pricing_window(D1)
+    with get_conn(db) as conn:
+        conn.execute(
+            "DELETE FROM prices WHERE slot_start IN "
+            "(SELECT slot_start FROM prices WHERE slot_start >= ? ORDER BY slot_start LIMIT 6)",
+            (pf.isoformat(),),
+        )
+    assert _missing(db, L(10)) == [D1]
+
+
+def test_tariff_change_still_refetches_whole_window_before_1530(db, monkeypatch):
+    _seed_cosy(db, monkeypatch)
+    O.record_price_tariffs(db, agile_cfg())      # stamp says Agile, .env says Cosy
+    assert _missing(db, L(10)) == [D, D1]
+
+
+def test_fetch_logs_unpublished_outgoing_as_info_for_future_date(db, monkeypatch, caplog):
+    import logging
+    today = datetime.now(O.LONDON).date()
+    tomorrow = today + timedelta(days=1)
+    _patch_fetch(monkeypatch, {"E-1R-COSY-22-12-08-G": cosy_day(tomorrow)})
+    with caplog.at_level(logging.INFO, logger="octoopt2.data.octopus"):
+        O.fetch_and_store_prices(cfg(), db, for_date=tomorrow)
+    assert "check OCTOPUS_OUTGOING_TARIFF_CODE" not in caplog.text
+    assert "not published yet" in caplog.text
+    caplog.clear()
+    _patch_fetch(monkeypatch, {"E-1R-COSY-22-12-08-G": cosy_day(today)})
+    with caplog.at_level(logging.INFO, logger="octoopt2.data.octopus"):
+        O.fetch_and_store_prices(cfg(), db, for_date=today)
+    assert "check OCTOPUS_OUTGOING_TARIFF_CODE" in caplog.text
