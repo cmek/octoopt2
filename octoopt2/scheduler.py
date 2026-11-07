@@ -35,6 +35,8 @@ from .data.octopus import (
     fetch_and_store_standing_charges,
     get_prices_from,
     missing_price_dates,
+    price_tariffs_changed,
+    record_price_tariffs,
 )
 from .data.solcast import fetch_and_store_actuals, fetch_and_store_forecast, get_forecast
 from .data.weather import backfill_weather_history, fetch_and_store_weather, get_temperature_forecast
@@ -551,23 +553,30 @@ def _read_inverter(config: AppConfig, now: datetime):
 
 def _refresh_feeds(config: AppConfig, now: datetime) -> None:
     """Refresh all data feeds. Failures are logged but do not abort the tick."""
-    # Octopus prices — fetch for any date missing from DB
+    # Octopus prices — fetch for any date missing from DB, or every date in the
+    # window when the configured tariff codes changed since the last fetch (a
+    # tariff switch must replace today's and tomorrow's already-stored prices).
+    tariffs_changed = False
     try:
-        for d in missing_price_dates(config.db_path, look_ahead_days=2):
+        tariffs_changed = price_tariffs_changed(config.db_path, config.octopus)
+        for d in missing_price_dates(config.db_path, look_ahead_days=2, config=config.octopus):
             n = fetch_and_store_prices(config.octopus, config.db_path, for_date=d)
             if n == 0 and d > now.date():
                 logger.info("Tomorrow's prices not published yet")
         # Stamped for the whole cycle rather than inside fetch_and_store_prices:
         # prices are fetched only for dates missing from the DB, so on most ticks
         # there is no call at all. "Refresh completed, nothing outstanding" is the
-        # health signal we want; a raised exception skips the stamp.
+        # health signal we want; a raised exception skips the stamp (and leaves
+        # the tariff stamp alone, so the refetch is retried next cycle).
+        record_price_tariffs(config.db_path, config.octopus)
         record_fetch(config.db_path, "prices")
     except Exception as exc:
         logger.warning("Octopus price fetch failed: %s", exc)
 
-    # Octopus standing charge for the import tariff (24h TTL — skips if fresh)
+    # Octopus standing charge for the import tariff (24h TTL — skips if fresh,
+    # unless the tariff just changed: the table is keyed by tariff code).
     try:
-        fetch_and_store_standing_charges(config.octopus, config.db_path)
+        fetch_and_store_standing_charges(config.octopus, config.db_path, force=tariffs_changed)
     except Exception as exc:
         logger.warning("Octopus standing charge fetch failed: %s", exc)
 

@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from ..config import OctopusConfig
-from ..db import get_conn, record_fetch
+from ..db import get_conn, get_meta, record_fetch, set_meta
 from .rates import expand_records, record_from_api, window_slots, drop_off_boundary
 
 logger = logging.getLogger(__name__)
@@ -282,7 +282,33 @@ def get_prices_from(
     ]
 
 
-def missing_price_dates(db_path: str, look_ahead_days: int = 2) -> list[date]:
+PRICE_TARIFFS_META_KEY = "prices_tariffs"
+
+
+def tariff_signature(config: OctopusConfig) -> str:
+    """The pair of tariff codes a price fetch is made under."""
+    return f"{config.import_tariff_code}|{config.outgoing_tariff_code}"
+
+
+def price_tariffs_changed(db_path: str, config: OctopusConfig) -> bool:
+    """True when the stored prices were fetched under different tariff codes than
+    `config` now holds (or under none we know of). Rows in `prices` carry no
+    tariff code, so without this a tariff switch leaves the already-fetched days
+    — typically today and tomorrow — priced on the old tariff until they age
+    out: a banded tariff is published well ahead and never shows up as
+    "missing"."""
+    return get_meta(db_path, PRICE_TARIFFS_META_KEY) != tariff_signature(config)
+
+
+def record_price_tariffs(db_path: str, config: OctopusConfig) -> None:
+    """Stamp the tariff codes the stored prices now reflect. Call after every
+    outstanding date has been fetched without error."""
+    set_meta(db_path, PRICE_TARIFFS_META_KEY, tariff_signature(config))
+
+
+def missing_price_dates(
+    db_path: str, look_ahead_days: int = 2, config: OctopusConfig | None = None
+) -> list[date]:
     """Return dates within the next look_ahead_days that need a price fetch.
 
     A date needs fetching if:
@@ -290,9 +316,18 @@ def missing_price_dates(db_path: str, look_ahead_days: int = 2) -> list[date]:
     - any slot is missing its outgoing (sell) rate, i.e. sell_gbp_kwh IS NULL
       (fetched before sell rates were published, or before the correct outgoing
       tariff was configured). A genuine 0.0 or negative rate counts as known and
-      is not re-fetched.
+      is not re-fetched, OR
+    - `config` is given and its tariff codes differ from the ones the stored
+      prices were fetched under (see price_tariffs_changed) — then every date
+      in the window is returned so the switch takes effect at once.
     """
     today = datetime.now(LONDON).date()
+    if config is not None and price_tariffs_changed(db_path, config):
+        logger.info(
+            "Import/outgoing tariff is now %s — refetching the next %d day(s) of prices",
+            tariff_signature(config), look_ahead_days,
+        )
+        return [today + timedelta(days=o) for o in range(look_ahead_days)]
     missing = []
     for offset in range(look_ahead_days):
         d = today + timedelta(days=offset)
