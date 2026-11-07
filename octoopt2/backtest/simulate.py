@@ -128,6 +128,17 @@ def simulate_slot(
             return _finish(lim, soc_kwh, 0.0, exp, 0.0, dis, net - exp)
         return _finish(lim, soc_kwh, -net, 0.0, 0.0, dis, 0.0)
 
+    if mode == "HOLD":
+        # ECO with the reserve raised to the current SoC: surplus solar still
+        # charges (then exports), but a deficit is imported, never discharged.
+        surplus = solar - load
+        if surplus >= 0:
+            chg = min(surplus, lim.max_charge_kwh, lim.charge_headroom_kwh(soc_kwh))
+            rest = surplus - chg
+            exp = min(rest, lim.max_export_kwh)
+            return _finish(lim, soc_kwh, 0.0, exp, chg, 0.0, rest - exp)
+        return _finish(lim, soc_kwh, -surplus, 0.0, 0.0, 0.0, 0.0)
+
     if mode == "ECO":
         surplus = solar - load
         if surplus >= 0:

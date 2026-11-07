@@ -31,9 +31,20 @@ DHW per UK calendar day d (manage_dhw):
 
 Objective:
   minimise Σ_t ( buy_eff[t]*grid_import[t] - sell_eff[t]*grid_export[t]
-                 + cycle_cost*(bat_charge[t] + bat_discharge[t]) )
+                 + cycle_cost*(bat_charge[t] + bat_discharge[t])
+                 + ε·rank_after[t]*bat_charge[t] + ε·rank_before[t]*dhw_on[t] )
            - terminal_value * soc[n]
-  where buy_eff/sell_eff are the tariff prices plus any Axle event uplift
+  The two ε terms (ε = TIEBREAK_GBP_KWH, 0.01p/kWh) only order slots whose
+  effective buy price is *identical*: rank_before/rank_after count the other
+  slots in the horizon with the same price before/after slot t and are zero
+  for a unique price, so on a half-hourly tariff (Agile) they vanish. On a
+  banded tariff (Cosy) they place grid charging as LATE as possible in a band
+  (the inverter's ECO mode drains an idle battery into house load, so fill it
+  just before it is needed and let each re-solve top up) and DHW as EARLY as
+  possible in the day (the daily quota cannot be lost to the partial-day rule
+  and the tank is hot for the morning). CBC otherwise picks arbitrarily among
+  equal-cost slots and the choice can move at every re-solve.
+  buy_eff/sell_eff are the tariff prices plus any Axle event uplift
   (inputs.axle_uplift: + on sell for export events, − on buy for import
   events). slot_cost_gbp uses the same effective prices so it reflects what the
   plan is worth; the tariff prices stay in inputs for persistence.
@@ -112,7 +123,7 @@ class SlotDecision:
 @dataclass
 class OptimizerResult:
     decisions: list[SlotDecision]
-    total_cost_gbp: float      # objective value: grid cost + virtual cycle cost - terminal value
+    total_cost_gbp: float      # objective value: grid cost + virtual cycle cost + tie-breaks - terminal value
     solver_status: str
     optimized_at: datetime
     solve_seconds: float = 0.0
@@ -236,15 +247,23 @@ def optimize(
     # the break-even spread by roughly 2× cycle_cost (≈3p with the default 1.5p).
     # Energy left in the battery at the horizon end is credited at
     # terminal_soc_value so the plan does not drain to the floor merely because
-    # the horizon (which can be as short as a few hours before tomorrow's
-    # prices are published) ends.
+    # the horizon ends (on Agile it can be as short as a few hours before
+    # tomorrow's prices are published; on a banded tariff it always reaches
+    # 23:00 UK tomorrow).
+    # The tie-break terms are zero unless two slots share the same effective
+    # buy price (see the module docstring): charge late, DHW early, within a
+    # run of equal prices only. Grouped on buy_eff so a tie is a tie in what
+    # the plan pays, Axle uplift included.
     buy_eff, sell_eff = inputs.effective_prices()
     uplift = inputs.axle_uplift or [0.0] * n
+    rank_before, rank_after = _equal_price_ranks(buy_eff)
     prob += (
         pulp.lpSum(
             buy_eff[t] * grid_import[t]
             - sell_eff[t] * grid_export[t]
             + battery.cycle_cost_gbp_kwh * (bat_charge[t] + bat_discharge[t])
+            + TIEBREAK_GBP_KWH * rank_after[t] * bat_charge[t]
+            + TIEBREAK_GBP_KWH * rank_before[t] * dhw_on[t]
             for t in range(n)
         )
         - terminal_soc_value_gbp_kwh * soc[n]
@@ -380,6 +399,34 @@ def _val(var: pulp.LpVariable) -> float:
     """Extract solved variable value, defaulting to 0 if not set."""
     v = pulp.value(var)
     return 0.0 if v is None else float(v)
+
+
+# Per-rank step of the equal-price tie-breaks (£/kWh): 0.01p. Far below the
+# 1.5p cycle cost and any real tariff step, far above CBC's 1e-5 objective
+# increment; at most ~48 ranks on Cosy so the whole spread stays under 0.5p.
+TIEBREAK_GBP_KWH = 1e-4
+
+
+def _equal_price_ranks(prices: list[float]) -> tuple[list[int], list[int]]:
+    """Per slot: (# slots with the same price BEFORE it, # AFTER it).
+
+    Both are 0 when the price is unique in the horizon, so tie-break terms
+    built from them vanish on a half-hourly tariff and only order the
+    equal-price slots of a banded one. Equality is on the price rounded to
+    1e-6 £ (the API's 0.0001p resolution), grouped across the whole horizon,
+    not just contiguous runs: "latest equal-price slot" then means the cheap
+    band nearest the use, e.g. 13–16 rather than 04–07 for the evening peak.
+    """
+    groups: dict[float, list[int]] = {}
+    for t, p in enumerate(prices):
+        groups.setdefault(round(p, 6), []).append(t)
+    before = [0] * len(prices)
+    after = [0] * len(prices)
+    for idx in groups.values():
+        for r, t in enumerate(idx):
+            before[t] = r
+            after[t] = len(idx) - 1 - r
+    return before, after
 
 
 def _group_slots_by_day(slot_starts: list[datetime]) -> dict[date, list[int]]:

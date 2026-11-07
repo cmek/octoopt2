@@ -35,6 +35,13 @@ class BatteryConfig:
     # just because the horizon ends. None → use the mean buy price of the
     # horizon scaled by discharge efficiency; 0 → legacy behaviour (no value).
     terminal_value_gbp_kwh: float | None = None
+    # What to do in a slot whose plan leaves the battery idle (no charge, no
+    # discharge). "eco": dynamic self-use — the inverter still discharges into
+    # house load, so an idle cheap-band slot drains what was just charged.
+    # "hold": ECO with both reserve registers raised to the slot's planned
+    # end-of-slot SoC, so the battery keeps its charge (solar surplus still
+    # charges it). Discharge-to-load slots run as plain ECO in both modes.
+    idle_mode: str = "eco"
 
     @property
     def min_soc_kwh(self) -> float:
@@ -52,6 +59,9 @@ class BatteryConfig:
     def from_env(cls) -> "BatteryConfig":
         d = cls()
         tv = os.getenv("BATTERY_TERMINAL_VALUE_GBP_KWH")
+        idle = (os.getenv("BATTERY_IDLE_MODE") or d.idle_mode).strip().lower()
+        if idle not in ("eco", "hold"):
+            raise ValueError(f"BATTERY_IDLE_MODE must be 'eco' or 'hold', got {idle!r}")
         return cls(
             capacity_kwh=float(os.getenv("BATTERY_CAPACITY_KWH", d.capacity_kwh)),
             min_soc_pct=float(os.getenv("BATTERY_MIN_SOC_PCT", d.min_soc_pct)),
@@ -63,6 +73,7 @@ class BatteryConfig:
             cycle_cost_gbp_kwh=float(os.getenv("BATTERY_CYCLE_COST_GBP_KWH", d.cycle_cost_gbp_kwh)),
             hw_reserve_pct=int(os.getenv("BATTERY_HW_RESERVE_PCT", d.hw_reserve_pct)),
             terminal_value_gbp_kwh=None if tv in (None, "", "auto") else float(tv),
+            idle_mode=idle,
         )
 
 

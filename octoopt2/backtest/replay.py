@@ -10,9 +10,15 @@ horizon, forecast noise, model mismatch).
 
 Level 2 — rolling-horizon replay (opt-in, slow): re-solve the MILP at every
 slot with only the information the live controller had — prices known up to
-23:00 UK (tomorrow's only after 16:00), the stored load prediction and the
-Solcast P50 — and execute each first decision on the simulator. This is
-"what the current algorithm would have done with perfect execution".
+23:00 UK (for a half-hourly import, tomorrow's only after 16:00; for a banded
+import such as Cosy, whose rates are published far ahead, always 23:00 UK
+tomorrow, with tomorrow's export price replaced by the controller's
+``min(buy, last published sell)`` fallback until 16:00), the stored load
+prediction and the Solcast P50 — and execute each first decision on the
+simulator. This is "what the current algorithm would have done with perfect
+execution". Whether a day is banded is read off the price structure of the
+day being replayed (``_is_banded_day``), so the stored-DB tariff is handled
+correctly across a tariff switch; ``RollingOptions.horizon`` overrides it.
 """
 from __future__ import annotations
 
@@ -77,15 +83,45 @@ def run_planned_executed(
 
 # ── Level 2 ───────────────────────────────────────────────────────────────────
 
-def _known_horizon_end(now: datetime) -> datetime:
-    """Agile publication rule: prices run to 23:00 UK today; tomorrow's day is
-    known once local time is past 16:00."""
+def _known_horizon_end(now: datetime, *, banded_import: bool = False) -> datetime:
+    """Prices the live controller had at `now`. Half-hourly import (Agile):
+    to 23:00 UK today, tomorrow's day once local time is past 16:00. Banded
+    import: the feed keeps today and tomorrow, so always 23:00 UK tomorrow."""
     local = now.astimezone(LONDON)
-    end_day = local.date() if local.hour < 16 else local.date() + timedelta(days=1)
+    if banded_import or local.hour >= 16:
+        end_day = local.date() + timedelta(days=1)
+    else:
+        end_day = local.date()
     end = datetime(end_day.year, end_day.month, end_day.day, 23, 0, tzinfo=LONDON)
     if end <= local:
         end += timedelta(days=1)
     return end
+
+
+# A banded day (Cosy 3 bands, Go 2, Flux 3, flexible 1) has a handful of
+# distinct prices; an Agile day has dozens.
+BANDED_MAX_DISTINCT = 8
+
+
+def _is_banded_day(prices: list[float]) -> bool:
+    return len({round(p, 6) for p in prices}) <= BANDED_MAX_DISTINCT
+
+
+def _replay_sell(
+    buy: list[float], sell: list[float], idx: list[int], slots: list[Slot], sell_known_end: datetime,
+) -> list[float]:
+    """Sell prices as the controller saw them on a banded day: the real rate up
+    to `sell_known_end` (Agile Outgoing's publication edge), then
+    ``min(buy, last published)`` exactly as scheduler.run fills NULL rates."""
+    out: list[float] = []
+    last: float | None = None
+    for k in idx:
+        if slots[k].slot_start < sell_known_end:
+            last = sell[k]
+            out.append(sell[k])
+        else:
+            out.append(min(buy[k], last) if last is not None else buy[k])
+    return out
 
 
 @dataclass
@@ -97,6 +133,7 @@ class RollingOptions:
     load_source: str = "pred"       # pred | actual
     cycle_cost: float | None = None  # None → battery config value
     terminal: str = "value"
+    horizon: str = "auto"           # auto (per-day from price structure) | agile | banded
 
 
 def run_rolling_replay(
@@ -115,13 +152,27 @@ def run_rolling_replay(
     flows: list[SimFlow] = []
     soc = segment.soc0_kwh
     pending: list[SlotDecision] = []
+    if opts.horizon == "auto":
+        banded_by_day = {d: _is_banded_day([buy[k] for k in ix]) for d, ix in segment.day_index.items()}
+    else:
+        banded_by_day = {}
     for t in range(n):
         if not pending or (t % opts.replan_every == 0):
-            end = _known_horizon_end(slots[t].slot_start)
+            if opts.horizon == "auto":
+                banded = banded_by_day.get(slots[t].london_day, False)
+            else:
+                banded = opts.horizon == "banded"
+            end = _known_horizon_end(slots[t].slot_start, banded_import=banded)
             idx = [k for k in range(t, n) if slots[k].slot_start < end]
             if not idx:
                 idx = [t]
             win = [slots[k] for k in idx]
+            if banded:
+                # Export is still day-ahead: beyond its publication edge the
+                # controller planned with the NULL-sell fallback, not real rates.
+                sell_win = _replay_sell(buy, sell, idx, slots, _known_horizon_end(slots[t].slot_start))
+            else:
+                sell_win = [sell[k] for k in idx]
             if opts.solar_source == "actual":
                 solar = [s.solar_kwh or 0.0 for s in win]
             elif opts.solar_source == "pred":
@@ -135,7 +186,7 @@ def run_rolling_replay(
                 load = [(s.pred_load_kwh if s.pred_load_kwh is not None else s.load_kwh or 0.0) for s in win]
             inputs = OptimizerInput(
                 slot_starts=[s.slot_start for s in win], initial_soc_kwh=soc,
-                buy_prices=[buy[k] for k in idx], sell_prices=[sell[k] for k in idx],
+                buy_prices=[buy[k] for k in idx], sell_prices=sell_win,
                 solar_forecast=solar, load_forecast=load,
             )
             kwargs: dict = {"time_limit_s": opts.time_limit_s}

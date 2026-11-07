@@ -13,7 +13,7 @@ def _balanced(f, solar, load):
     return abs(solar - f.curtail_kwh + f.import_kwh + f.discharge_kwh - load - f.export_kwh - f.charge_kwh) < 1e-9
 
 
-@pytest.mark.parametrize("mode", ["ECO", "CHARGE", "DISCHARGE_EXPORT", "NO_BATTERY"])
+@pytest.mark.parametrize("mode", ["ECO", "HOLD", "CHARGE", "DISCHARGE_EXPORT", "NO_BATTERY"])
 @pytest.mark.parametrize("soc_frac", [0.0, 0.1, 0.5, 1.0])
 @pytest.mark.parametrize("solar,load", [(0.0, 0.4), (2.6, 0.4), (0.5, 0.5), (0.3, 3.0)])
 def test_balance_and_bounds(lim, mode, soc_frac, solar, load):

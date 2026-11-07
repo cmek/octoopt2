@@ -6,7 +6,7 @@ expected to be Agile Outgoing (half-hourly, published ~16:00 for the next day)
 but any product works through the same path.
 """
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -22,6 +22,13 @@ LONDON = ZoneInfo("Europe/London")
 
 # Standing charges change a few times a year; once a day is plenty.
 STANDING_TTL_HOURS = 24
+
+# Agile Outgoing (export) rates for tomorrow appear around 16:00 UK. A future
+# date whose only gap is the sell price is not re-fetched before this, so a
+# banded import tariff — whose buy rows exist from the first fetch — is not
+# polled (and warned about) at every slot boundary all day. Inert on Agile:
+# tomorrow has no rows at all before 16:00.
+OUTGOING_REFETCH_FROM = time(15, 30)
 
 
 def _fetch_unit_rates(
@@ -109,12 +116,21 @@ def fetch_and_store_prices(
     )
 
     if not sell_rates:
-        logger.warning(
-            "No sell rates returned for %s — check OCTOPUS_OUTGOING_TARIFF_CODE in .env "
-            "(tariff: %s)",
-            for_date,
-            config.outgoing_tariff_code,
-        )
+        if buy_rates and for_date > datetime.now(LONDON).date():
+            # Normal on a banded import: tomorrow's bands are known long before
+            # Agile Outgoing publishes. Stored with sell = NULL and completed
+            # later (see missing_price_dates / OUTGOING_REFETCH_FROM).
+            logger.info(
+                "Outgoing rates for %s not published yet — storing %d buy record(s), sell left NULL",
+                for_date, len(buy_rates),
+            )
+        else:
+            logger.warning(
+                "No sell rates returned for %s — check OCTOPUS_OUTGOING_TARIFF_CODE in .env "
+                "(tariff: %s)",
+                for_date,
+                config.outgoing_tariff_code,
+            )
 
     # One row per half-hour slot of the window. Agile records are already
     # half-hourly (no-op); Cosy/Go/Flux bands cover several slots each and any
@@ -307,21 +323,33 @@ def record_price_tariffs(db_path: str, config: OctopusConfig) -> None:
 
 
 def missing_price_dates(
-    db_path: str, look_ahead_days: int = 2, config: OctopusConfig | None = None
+    db_path: str,
+    look_ahead_days: int = 2,
+    config: OctopusConfig | None = None,
+    *,
+    now: datetime | None = None,
 ) -> list[date]:
     """Return dates within the next look_ahead_days that need a price fetch.
 
     A date needs fetching if:
-    - it has no buy prices at all, OR
+    - it has fewer buy-price rows than its pricing window has slots (none at
+      all, or a band dropped on the way in), OR
     - any slot is missing its outgoing (sell) rate, i.e. sell_gbp_kwh IS NULL
       (fetched before sell rates were published, or before the correct outgoing
       tariff was configured). A genuine 0.0 or negative rate counts as known and
-      is not re-fetched, OR
+      is not re-fetched. Exception: a *future* date with complete buy rows is
+      left alone before OUTGOING_REFETCH_FROM (15:30 UK), since Agile Outgoing
+      for tomorrow is not published before ~16:00 — otherwise a banded import
+      tariff would be re-polled at every slot boundary all day. Today is always
+      re-fetched while a sell rate is missing, OR
     - `config` is given and its tariff codes differ from the ones the stored
       prices were fetched under (see price_tariffs_changed) — then every date
       in the window is returned so the switch takes effect at once.
+
+    `now` (any tz-aware datetime) defaults to the wall clock; tests inject it.
     """
-    today = datetime.now(LONDON).date()
+    now_london = (now or datetime.now(timezone.utc)).astimezone(LONDON)
+    today = now_london.date()
     if config is not None and price_tariffs_changed(db_path, config):
         logger.info(
             "Import/outgoing tariff is now %s — refetching the next %d day(s) of prices",
@@ -332,6 +360,7 @@ def missing_price_dates(
     for offset in range(look_ahead_days):
         d = today + timedelta(days=offset)
         period_from, period_to = _pricing_window(d)
+        expected = len(window_slots(period_from, period_to))
         with get_conn(db_path) as conn:
             row = conn.execute(
                 """
@@ -342,7 +371,11 @@ def missing_price_dates(
                 """,
                 (period_from.isoformat(), period_to.isoformat()),
             ).fetchone()
-        if row["total"] == 0 or row["with_sell"] < row["total"]:
+        if row["total"] < expected:
+            missing.append(d)
+        elif (row["with_sell"] or 0) < row["total"]:
+            if d > today and now_london.time() < OUTGOING_REFETCH_FROM:
+                continue   # buy complete, export not due yet — leave it until 15:30
             missing.append(d)
     return missing
 

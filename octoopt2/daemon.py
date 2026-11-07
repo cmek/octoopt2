@@ -133,7 +133,7 @@ def _make_handler(state: "DaemonState", config: AppConfig):
                 try:
                     payload = build_status(
                         state, config.db_path, config.battery.capacity_kwh, dhw_cfg=config.dhw,
-                        axle_cfg=config.axle,
+                        axle_cfg=config.axle, idle_mode=config.battery.idle_mode,
                     )
                     body = json.dumps(payload).encode()
                     self._send(200, "application/json", body, cache=False)

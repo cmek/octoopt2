@@ -108,6 +108,9 @@ def registers_consistent(
     elif mode == "DISCHARGE_EXPORT":
         expect = {"enable_discharge": 1, "enable_charge": 0, "eco_mode": 0,
                   "discharge_limit": power_reg}
+    elif mode == "HOLD":
+        expect = {"eco_mode": 1, "enable_charge": 0, "enable_discharge": 0,
+                  "soc_reserve": power_reg, "power_reserve": power_reg}
     else:
         expect = {"eco_mode": 1, "enable_charge": 0, "enable_discharge": 0,
                   "soc_reserve": hw_reserve_pct, "power_reserve": hw_reserve_pct}
@@ -184,9 +187,18 @@ def _log_command(
 def decision_to_mode(decision: SlotDecision, battery: BatteryConfig) -> tuple[str, float]:
     """Map a slot decision to the hardware mode the controller will apply.
 
-    Returns (mode, power_kw) with mode in {"CHARGE", "DISCHARGE_EXPORT", "ECO"}
-    and power_kw the requested charge/discharge rate (0 for ECO). Pure: used by
-    apply_decision and by the backtest replay so both apply identical rules.
+    Returns (mode, power_kw) with mode in {"CHARGE", "DISCHARGE_EXPORT", "HOLD",
+    "ECO"} and power_kw the requested charge/discharge rate (0 for HOLD/ECO).
+    Pure: used by apply_decision and by the backtest replay so both apply
+    identical rules.
+
+    HOLD is only produced with ``battery.idle_mode == "hold"``, for a slot
+    whose plan neither charges nor discharges: ECO would still discharge into
+    house load, which on a banded tariff drains a battery that was just filled
+    in the same cheap band. HOLD is ECO with the reserve registers raised to
+    the slot's planned end SoC (see hold_reserve_pct). A discharge-to-load
+    slot stays ECO in both modes — a floor there would force imports while the
+    battery still holds energy the plan wanted to use.
 
     Only force-discharge when the plan is to EXPORT. A discharge-to-meet-load
     decision is run as dynamic self-consumption (ECO) instead: forcing the
@@ -201,7 +213,18 @@ def decision_to_mode(decision: SlotDecision, battery: BatteryConfig) -> tuple[st
         return "CHARGE", decision.battery_charge_kwh / 0.5
     if wants_discharge and wants_export:
         return "DISCHARGE_EXPORT", decision.battery_discharge_kwh / 0.5
+    if battery.idle_mode == "hold" and not wants_discharge:
+        return "HOLD", 0.0
     return "ECO", 0.0
+
+
+def hold_reserve_pct(decision: SlotDecision, battery: BatteryConfig) -> int:
+    """Reserve (%) written for a HOLD slot: the plan's end-of-slot SoC, clamped
+    to [hw_reserve_pct, 100]. Taken from the *plan*, not the live reading, so
+    the value is constant for the whole slot and the unchanged-command check
+    skips repeat writes."""
+    pct = round(decision.soc_end_kwh / battery.capacity_kwh * 100) if battery.capacity_kwh > 0 else 0
+    return max(battery.hw_reserve_pct, min(100, pct))
 
 
 def apply_decision(
@@ -229,6 +252,8 @@ def apply_decision(
         power_reg = _kw_to_register(power_kw, battery.max_charge_rate_kw)
     elif mode == "DISCHARGE_EXPORT":
         power_reg = _kw_to_register(power_kw, battery.max_discharge_rate_kw)
+    elif mode == "HOLD":
+        power_reg = hold_reserve_pct(decision, battery)   # the reserve doubles as the "level"
     else:
         power_reg = 0
 
@@ -269,6 +294,8 @@ def apply_decision(
         reqs = _cmds_charge(power_kw, power_reg, last_mode)
     elif mode == "DISCHARGE_EXPORT":
         reqs = _cmds_discharge(power_kw, power_reg, last_mode)
+    elif mode == "HOLD":
+        reqs = _cmds_eco(soc_reserve_pct=power_reg, hold=True)
     else:
         reqs = _cmds_eco(soc_reserve_pct=battery.hw_reserve_pct)
 
@@ -388,8 +415,10 @@ def _cmds_discharge(discharge_kw: float, limit: int, last_mode: str | None) -> l
     return reqs
 
 
-def _cmds_eco(soc_reserve_pct: int = 4) -> list:
-    """Build ECO (dynamic self-consumption) commands.
+def _cmds_eco(soc_reserve_pct: int = 4, *, hold: bool = False) -> list:
+    """Build ECO (dynamic self-consumption) commands. With ``hold`` the same
+    registers are written but the reserve is the slot's planned SoC, so the
+    battery neither discharges into load nor is force-charged (HOLD mode).
 
     Both schedules are disabled. Disabling the *charge* schedule is essential:
     _cmds_charge arms a 00:00–23:59 charge window, and while that window is
@@ -402,7 +431,10 @@ def _cmds_eco(soc_reserve_pct: int = 4) -> list:
     configured planning floor instead of silently reverting to GivEnergy's 4%
     (SoC reserve) or keeping a stale discharge-power reserve.
     """
-    logger.info("Inverter → ECO (dynamic mode), SoC reserve %d%%", soc_reserve_pct)
+    if hold:
+        logger.info("Inverter → HOLD (ECO with reserve at planned SoC %d%%)", soc_reserve_pct)
+    else:
+        logger.info("Inverter → ECO (dynamic mode), SoC reserve %d%%", soc_reserve_pct)
     return [
         *commands.set_discharge_mode_to_match_demand(),
         *commands.set_battery_soc_reserve(soc_reserve_pct),

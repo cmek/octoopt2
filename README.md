@@ -74,7 +74,9 @@ The MILP is solved with PuLP/CBC for all remaining slots in the current pricing 
 
 Constraints enforce AC power balance, SoC bounds, no simultaneous charge+discharge, no simultaneous import+export, and daily DHW minimum/maximum slot counts.
 
-The objective is to minimise `Σ (buy_price × import − sell_price × export)` across all slots.
+The objective is to minimise `Σ (buy_price × import − sell_price × export + cycle_cost × battery throughput)` across all slots, minus a terminal value for energy left in the battery at the horizon end (`BATTERY_TERMINAL_VALUE_GBP_KWH`, default: mean buy price × efficiency). Two 0.01p/kWh tie-break terms act only between slots whose buy price is *identical*, which never happens on a half-hourly tariff and happens all day on a banded one such as Cosy: grid charging is placed as late as possible within a cheap band (the inverter's ECO mode drains an idle battery into house load, so fill it just before it is needed and let each 30-minute re-solve top up) and DHW as early as possible in the day. Without them the solver picks arbitrarily among equal-cost slots and the choice can move at every re-solve.
+
+Export prices are day-ahead (Agile Outgoing, ~16:00); slots whose sell rate is not published yet use `min(buy, last published sell)`. On a banded import tariff tomorrow's buy prices are stored from the first fetch and the day is not re-polled for its export rate before 15:30 UK.
 
 ### Control
 
@@ -113,6 +115,21 @@ The value persists in the inverter's flash until changed again. Keep `min_soc_pc
 > by a CHARGE slot stayed active through every following ECO slot, during which
 > the inverter neither discharged to the house nor stopped grid-charging
 > (measured Sep–Oct 2026: the battery served under 1% of load in those slots).
+
+#### Idle slots: ECO or hold (`BATTERY_IDLE_MODE`)
+
+A slot whose plan neither charges nor discharges the battery runs as ECO by
+default, and ECO still discharges into house load. On a tariff with long flat
+cheap bands that means the battery filled at the start of a band drains again
+before the band ends. `BATTERY_IDLE_MODE=hold` (default `eco`, so nothing
+changes unless set) writes ECO with both reserve registers raised to the slot's
+planned end-of-slot SoC instead: the battery keeps its charge, solar surplus
+still charges it, and a deficit is imported. Discharge-to-load slots are plain
+ECO in both modes. The next ECO slot restores `BATTERY_HW_RESERVE_PCT`; if the
+daemon dies while holding, the hardware floor stays raised until it is next
+written (a restart's first ECO slot, `octoopt2-set-reserve`, or `octoopt2-away`),
+so run the daemon under a supervisor that restarts it. Measure the benefit first
+with `octoopt2-backtest --replay --idle-mode hold` (below).
 
 #### Away mode (leaving the system unattended)
 
@@ -438,6 +455,31 @@ public Octopus products API and cached in the DB (`tariff_rates`); banded tariff
 are expanded in UTC exactly as Octopus publishes them. `--sell-fixed`,
 `--cycle-cost`, `--min-soc`, `--max-discharge-kw` and `--terminal` are the
 sensitivity knobs. `--output` writes `web/backtests/<from>_<to>.json`.
+
+The rolling replay gives each day the price horizon the live controller had:
+23:00 UK today (tomorrow's after 16:00) on a half-hourly day, 23:00 UK tomorrow
+on a banded day, with tomorrow's export price replaced by the controller's
+`min(buy, last published sell)` fallback until 16:00. Days are classified from
+the price structure (`--replay-horizon` overrides). `--idle-mode hold` runs the
+simulator with `BATTERY_IDLE_MODE=hold` semantics.
+
+Measuring a tariff switch (e.g. the first week on Cosy, which started on
+2026-11-07):
+
+```bash
+cp octoopt2.db /tmp/bt.db
+uv run octoopt2-backtest --db /tmp/bt.db --from 2026-11-08 --to 2026-11-15 \
+    --tariffs agile,cosy+agileout --replay --replay-load model --load-temp forecast \
+    --cycle-cost 0.015 [--idle-mode hold]
+```
+
+The pair named `agile` means "the prices stored in the DB", i.e. whatever the
+controller actually planned with (Cosy after the switch); it is the only pair
+with the **planned** column and the execution diagnostics. `replay − actual` is
+the execution gap, `replay − hindsight` the planning gap, and the
+"ECO (discharge-to-load)" row of the diagnostics shows how much the battery
+served load in slots the plan left idle — the drain that `--idle-mode hold`
+removes.
 
 ### Preload historical consumption
 
